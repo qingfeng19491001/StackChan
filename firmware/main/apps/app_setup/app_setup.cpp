@@ -188,6 +188,7 @@ void AppSetup::onClose()
     view::destroy_status_bar();
 
     if (_need_warm_reset) {
-        GetHAL().requestWarmReboot(6);
+        // MEETING is inserted before SETUP in the launcher app order.
+        GetHAL().requestWarmReboot(7);
     }
 }

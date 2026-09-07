@@ -15,6 +15,11 @@
 #include <array>
 #include <lvgl_image.h>
 #include <string_view>
+#include <vector>
+
+#include <stackchan/meeting_protocol.h>
+#include <stackchan/meeting_control_policy.h>
+#include <stackchan/meeting_transport_policy.h>
 
 /**
  * @brief
@@ -38,6 +43,62 @@ enum class WsSignalSource {
 struct WsTextMessage_t {
     std::string name;
     std::string content;
+};
+
+struct WsMeetingCommand_t {
+    MeetingInboundAction action = MeetingInboundAction::None;
+    std::string messageId;
+    std::string commandId;
+    std::string sessionId;
+    bool duplicate = false;
+};
+
+enum class MeetingEventKind {
+    ControlRejected = 0,
+    RemoteError,
+    TransportFailure,
+};
+
+struct MeetingEvent_t {
+    MeetingEventKind kind = MeetingEventKind::ControlRejected;
+    MeetingControlError controlError = MeetingControlError::None;
+    MeetingTransportError transportError = MeetingTransportError::None;
+    std::string messageId;
+    std::string commandId;
+    std::string sessionId;
+    std::string code;
+    MeetingEnqueueDisposition_t responseDisposition;
+};
+
+struct MeetingTransportSnapshot_t {
+    bool connected = false;
+    bool protocolSelected = false;
+    size_t queuedFrames = 0;
+    size_t queuedBytes = 0;
+    bool hasLocalSocketAcceptedSequence = false;
+    uint32_t lastLocalSocketAcceptedSequence = 0;
+    uint64_t lastLocalSocketAcceptedTicket = 0;
+    bool pressureActive = false;
+    uint64_t firstFailureMs = 0;
+    bool failureLatched = false;
+    MeetingTransportError error = MeetingTransportError::None;
+    MeetingTransportError pressureCause = MeetingTransportError::None;
+};
+
+enum class MeetingPairingStatus {
+    Ready = 0,
+    MissingCredential,
+    NetworkUnavailable,
+    Unauthorized,
+    DeviceOffline,
+    ProtocolUnsupported,
+    InvalidResponse,
+};
+
+struct MeetingPairingNonce_t {
+    MeetingPairingStatus status = MeetingPairingStatus::NetworkUnavailable;
+    std::string pairUri;
+    int64_t expiresAt = 0;
 };
 
 /**
@@ -250,8 +311,22 @@ public:
     uitk::Signal<std::shared_ptr<LvglImage>> onWsVideoFrame;
     uitk::Signal<std::string_view> onWsDanceData;
     uitk::Signal<CommonLogLevel, std::string_view> onWsLog;
+    uitk::Signal<bool> onWsConnectionChanged;
+    uitk::Signal<bool> onWsMeetingProtocolSelected;
+    uitk::Signal<const WsMeetingCommand_t&> onWsMeetingCommand;
+    uitk::Signal<const MeetingEvent_t&> onMeetingEvent;
 
     void startWebSocketAvatarService(std::function<void(std::string_view)> onStartLog);
+    void ensureWebSocketAvatarServiceStarted(std::function<void(std::string_view)> onStartLog = {});
+    MeetingEnqueueDisposition_t enqueueMeetingOpusFrame(const stackchan::meeting::AudioFrame& frame);
+    MeetingEnqueueDisposition_t enqueueMeetingControl(std::string_view json);
+    MeetingTransportSnapshot_t getMeetingTransportSnapshot();
+    bool beginMeetingTransportSession();
+    void serviceMeetingTransport();
+    void markMeetingCommandStopped(std::string_view session_id, std::string_view command_id);
+    void markMeetingCommandStartFailed(std::string_view session_id, std::string_view command_id);
+    void abortMeetingCommandState();
+    MeetingPairingNonce_t requestMeetingPairingNonce();
 
     /* ----------------------------------- IMU ---------------------------------- */
     uitk::Signal<ImuMotionEvent> onImuMotionEvent;

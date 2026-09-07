@@ -17,6 +17,15 @@ __attribute__((weak)) std::string get_server_url()
 #endif
 }
 
+__attribute__((weak)) std::string get_device_credential()
+{
+#ifdef CONFIG_STACKCHAN_DEVICE_CREDENTIAL
+    return CONFIG_STACKCHAN_DEVICE_CREDENTIAL;
+#else
+    return {};
+#endif
+}
+
 __attribute__((weak)) std::string generate_auth_token()
 {
     return "hi-stack-chan";
