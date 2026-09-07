@@ -243,6 +243,11 @@ public:
             runGenerationCallback(weak_gate, connection_generation, [](WebSocketAvatar& owner) {
                 ESP_LOGI(_tag.c_str(), "Disconnected!");
                 owner.setConnectionState(false);
+                // Some WebSocket implementations invoke OnDisconnected before
+                // IsConnected() flips to false.  Record the event explicitly
+                // so the worker cannot miss the reconnect window after a
+                // Cloudflare 1006/EOF close.
+                owner._reconnect_requested.store(true);
             });
         });
 
@@ -277,12 +282,19 @@ public:
     void update()
     {
         auto websocket = socketSnapshot();
-        if (!websocket) {
+        if (_reconnect_requested.load() || !websocket) {
+            if (GetHAL().millis() - _last_reconnect_attempt > 5000) {
+                ESP_LOGI(_tag.c_str(), "Reconnecting to server after socket loss...");
+                _reconnect_requested.store(false);
+                connect();
+            }
             return;
         }
 
         if (!websocket->IsConnected()) {
             if (GetHAL().millis() - _last_reconnect_attempt > 5000) {
+                ESP_LOGI(_tag.c_str(), "Reconnecting to server...");
+                _reconnect_requested.store(false);
                 connect();
             }
         } else {
@@ -749,6 +761,7 @@ private:
     bool _shutdown_complete = false;
     std::string _url;
     uint32_t _last_reconnect_attempt = 0;
+    std::atomic<bool> _reconnect_requested{false};
     uint32_t _last_capture_time      = 0;
     static constexpr uint32_t kHeartbeatIntervalMs = 5000;
     static constexpr uint32_t kHeartbeatTimeoutMs  = 15000;

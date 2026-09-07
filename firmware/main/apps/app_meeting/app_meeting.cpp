@@ -573,9 +573,12 @@ void AppMeeting::refreshPairingQrIfNeeded(bool connected, bool protocol_selected
     }
 
     _next_pairing_attempt_ms = now + 5'000;
-    if (pairing.status == MeetingPairingStatus::MissingCredential ||
-        pairing.status == MeetingPairingStatus::Unauthorized ||
-        pairing.status == MeetingPairingStatus::ProtocolUnsupported) {
+    if (pairing.status == MeetingPairingStatus::DeviceOffline ||
+        pairing.status == MeetingPairingStatus::NetworkUnavailable) {
+        updateUiState(view::MeetingUiState::Reconnecting);
+    } else if (pairing.status == MeetingPairingStatus::MissingCredential ||
+               pairing.status == MeetingPairingStatus::Unauthorized ||
+               pairing.status == MeetingPairingStatus::ProtocolUnsupported) {
         updateUiState(view::MeetingUiState::Error);
     }
 }
