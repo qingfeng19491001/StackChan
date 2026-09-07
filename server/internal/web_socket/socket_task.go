@@ -144,35 +144,16 @@ func CheckExpiredLinks(ctx context.Context) {
 					}
 
 					//Remove camera subscription
-					newCamera := make([]*model.AppClient, 0, len(stackChanClient.GetCameraSubscriptionList()))
-					removedCamera := false
-					for _, sub := range stackChanClient.GetCameraSubscriptionList() {
-						if sub != nil && sub != client {
-							newCamera = append(newCamera, sub)
-						} else if sub == client {
-							removedCamera = true
-						}
-					}
-					stackChanClient.SetCameraSubscriptionList(newCamera)
-
-					if removedCamera && len(newCamera) == 0 && stackChanClient.GetConn() != nil {
+					removedCamera, cameraEmpty := stackChanClient.RemoveCameraSubscriber(client)
+					if removedCamera && cameraEmpty && stackChanClient.GetConn() != nil {
 						msg := createMessage(OffCamera, nil)
 						msgType := websocket.BinaryMessage
 						stackChanSendMessage(ctx, stackChanClient, &msgType, msg)
 					}
 
 					//Remove audio subscription
-					newAudio := make([]*model.AppClient, 0, len(stackChanClient.GetAudioSubscriptionList()))
-					removedAudio := false
-					for _, sub := range stackChanClient.GetAudioSubscriptionList() {
-						if sub != nil && sub != client {
-							newAudio = append(newAudio, sub)
-						} else if sub == client {
-							removedAudio = true
-						}
-					}
-					stackChanClient.SetAudioSubscriptionList(newAudio)
-					if removedAudio && len(newAudio) == 0 && stackChanClient.GetConn() != nil {
+					removedAudio, audioEmpty := stackChanClient.RemoveAudioSubscriber(client)
+					if removedAudio && audioEmpty && stackChanClient.GetConn() != nil {
 						msg := createMessage(OffAudio, nil)
 						msgType := websocket.BinaryMessage
 						stackChanSendMessage(ctx, stackChanClient, &msgType, msg)
@@ -203,10 +184,12 @@ func CheckExpiredLinks(ctx context.Context) {
 					logger.Errorf(ctx, "Close AppClient conn panic: %v", r)
 				}
 			}()
-			client.CloseWriterCoroutine()
-			if client.GetConn() != nil {
-				_ = client.GetConn().Close()
-				client.SetConn(nil)
+			conn, generation := client.ConnectionSnapshot()
+			if client.ClearConnection(generation) {
+				client.CloseWriterCoroutine()
+				if conn != nil {
+					_ = conn.Close()
+				}
 			}
 		}()
 	}
@@ -266,11 +249,14 @@ func CheckExpiredLinks(ctx context.Context) {
 
 		logger.Infof(ctx, "Kicked out expired StackChan client: %s", mac)
 
-		stackChanClient.CloseWriterCoroutine()
-		conn := stackChanClient.GetConn()
-		stackChanClient.SetConn(nil)
+		conn, generation := stackChanClient.ConnectionSnapshot()
+		cleared := stackChanClient.ClearConnection(generation)
+		if cleared {
+			meetingManager.OnDeviceDisconnect(ctx, mac)
+			stackChanClient.CloseWriterCoroutine()
+		}
 
-		if conn != nil {
+		if conn != nil && cleared {
 			func() {
 				defer func() {
 					if r := recover(); r != nil {

@@ -6,7 +6,7 @@ spec:
   ports:
   - port: 80
     protocol: TCP
-    targetPort: 8000
+    targetPort: http
   selector:
     app: template-single
 
