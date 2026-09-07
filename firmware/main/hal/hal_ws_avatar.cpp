@@ -233,6 +233,7 @@ public:
             runGenerationCallback(weak_gate, connection_generation, [](WebSocketAvatar& owner) {
                 ESP_LOGI(_tag.c_str(), "Connected to server!");
                 owner._last_heartbeat_time = GetHAL().millis();
+                owner._last_heartbeat_sent = owner._last_heartbeat_time;
                 owner.setConnectionState(true);
                 owner.sendProtocolHello();
             });
@@ -242,6 +243,11 @@ public:
             runGenerationCallback(weak_gate, connection_generation, [](WebSocketAvatar& owner) {
                 ESP_LOGI(_tag.c_str(), "Disconnected!");
                 owner.setConnectionState(false);
+                // Some WebSocket implementations invoke OnDisconnected before
+                // IsConnected() flips to false.  Record the event explicitly
+                // so the worker cannot miss the reconnect window after a
+                // Cloudflare 1006/EOF close.
+                owner._reconnect_requested.store(true);
             });
         });
 
@@ -276,23 +282,42 @@ public:
     void update()
     {
         auto websocket = socketSnapshot();
-        if (!websocket) {
+        if (_reconnect_requested.load() || !websocket) {
+            if (GetHAL().millis() - _last_reconnect_attempt > 5000) {
+                ESP_LOGI(_tag.c_str(), "Reconnecting to server after socket loss...");
+                _reconnect_requested.store(false);
+                connect();
+            }
             return;
         }
 
         if (!websocket->IsConnected()) {
             if (GetHAL().millis() - _last_reconnect_attempt > 5000) {
+                ESP_LOGI(_tag.c_str(), "Reconnecting to server...");
+                _reconnect_requested.store(false);
                 connect();
             }
         } else {
             processMessages();
             flushMeetingQueue();
 
+            // Keep the server's liveness timestamp fresh even when a proxy
+            // drops an individual server->device ping.  The server accepts
+            // the same framed pong in either direction, so this is harmless
+            // for older servers and prevents the 15s idle reaper from
+            // evicting an otherwise healthy device.
+            const uint32_t now = GetHAL().millis();
+            if (now - _last_heartbeat_sent >= kHeartbeatIntervalMs) {
+                if (sendPacket(DataType::HeartbeatPong, nullptr, 0)) {
+                    _last_heartbeat_sent = now;
+                }
+            }
+
             // Check heartbeat timeout
-            if (GetHAL().millis() - _last_heartbeat_time > 10000) {
+            if (now - _last_heartbeat_time > kHeartbeatTimeoutMs) {
                 ESP_LOGE(_tag.c_str(), "Heartbeat timeout!");
                 GetHAL().onWsLog.emit(CommonLogLevel::Error, "Heartbeat Timeout");
-                _last_heartbeat_time = GetHAL().millis();
+                _last_heartbeat_time = now;
                 return;
             }
         }
@@ -736,8 +761,12 @@ private:
     bool _shutdown_complete = false;
     std::string _url;
     uint32_t _last_reconnect_attempt = 0;
+    std::atomic<bool> _reconnect_requested{false};
     uint32_t _last_capture_time      = 0;
+    static constexpr uint32_t kHeartbeatIntervalMs = 5000;
+    static constexpr uint32_t kHeartbeatTimeoutMs  = 15000;
     uint32_t _last_heartbeat_time    = 0;
+    uint32_t _last_heartbeat_sent    = 0;
     bool _is_streaming               = false;
     bool _is_video_mode              = false;
     std::mutex _mutex;

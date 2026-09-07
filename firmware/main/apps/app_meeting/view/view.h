@@ -15,6 +15,7 @@ namespace view {
 
 enum class MeetingUiState {
     Disconnected,
+    Reconnecting,
     Ready,
     Preparing,
     Recording,
@@ -77,6 +78,10 @@ public:
             case MeetingUiState::Disconnected:
                 _status->setText("NOT CONNECTED");
                 setAction(false, "START FROM AURO");
+                break;
+            case MeetingUiState::Reconnecting:
+                _status->setText("RECONNECTING...");
+                setAction(false, "WAITING FOR SERVER");
                 break;
             case MeetingUiState::Ready:
                 _status->setText("READY");
