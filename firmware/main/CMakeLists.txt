@@ -133,11 +133,12 @@ else()
 endif()
 list(APPEND SOURCES ${BOARD_SOURCES})
 
-# Select audio processor according to Kconfig
+# The meeting mode can select NoAudioProcessor at runtime even when the normal
+# XiaoZhi path is built with AFE enabled, so always link the passthrough
+# processor and add AFE when configured.
+list(APPEND SOURCES "${XIAOZHI_MAIN_DIR}/audio/processors/no_audio_processor.cc")
 if(CONFIG_USE_AUDIO_PROCESSOR)
     list(APPEND SOURCES "${XIAOZHI_MAIN_DIR}/audio/processors/afe_audio_processor.cc")
-else()
-    list(APPEND SOURCES "${XIAOZHI_MAIN_DIR}/audio/processors/no_audio_processor.cc")
 endif()
 if(CONFIG_IDF_TARGET_ESP32S3 OR CONFIG_IDF_TARGET_ESP32P4)
     list(APPEND SOURCES "${XIAOZHI_MAIN_DIR}/audio/wake_words/afe_wake_word.cc")

@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "view.h"
+#include "launcher_selection_policy.h"
 #include <mooncake_log.h>
 #include <assets/assets.h>
 #include <functional>
@@ -27,18 +28,15 @@ public:
         _step_colors = stepColors;
         _step_gap    = stepGap;
 
-        _bg_color.duration = 0.3;
-        _bg_color.begin();
-
         jumpTo(0);
     }
 
     void jumpTo(int index)
     {
-        if (index < 0 || index >= _step_colors.size()) {
+        index = launcher_logical_index(index, static_cast<int>(_step_colors.size()));
+        if (index < 0) {
             return;
         }
-        _bg_color.teleport(_step_colors[index]);
         _current_index = index;
 
         if (onBgColorChanged) {
@@ -48,28 +46,14 @@ public:
 
     void update(int scrollValue)
     {
-        _last_index = _current_index;
-
-        // Update current index
-        _current_index = (scrollValue + _step_gap / 2) / _step_gap;
-        if (_current_index < 0) {
-            _current_index = 0;
-        }
-        if (_current_index >= _step_colors.size()) {
-            _current_index = _step_colors.size() - 1;
-        }
-
-        // If index changed
-        if (_last_index != _current_index) {
-            // mclog::tagInfo(_tag, "index changed from {} to {}", _last_index, _current_index);
-            _bg_color = _step_colors[_current_index];
-        }
-
-        // Update background color
-        _bg_color.update();
-        if (!_bg_color.done()) {
+        const int next_index = launcher_index_from_scroll(
+            scrollValue, _step_gap, static_cast<int>(_step_colors.size())
+        );
+        if (next_index >= 0 && next_index != _current_index) {
+            _current_index = next_index;
             if (onBgColorChanged) {
-                onBgColorChanged(_bg_color.toHex());
+                // Keep the background and label atomic at an icon boundary.
+                onBgColorChanged(_step_colors[_current_index]);
             }
         }
     }
@@ -77,9 +61,7 @@ public:
 private:
     std::vector<uint32_t> _step_colors;
     int _current_index = 0;
-    int _last_index    = 0;
     int _step_gap      = 0;
-    color::AnimateRgb_t _bg_color;
 };
 
 /* -------------------------------------------------------------------------- */
@@ -123,7 +105,8 @@ public:
 
     void jumpTo(int index)
     {
-        if (index < 0 || index >= _page_num) {
+        index = launcher_logical_index(index, _page_num);
+        if (index < 0) {
             return;
         }
         _current_index = index;
@@ -135,14 +118,7 @@ public:
     {
         _last_index = _current_index;
 
-        // Calculate absolute index
-        int abs_index = (scrollValue + _page_gap / 2) / _page_gap;
-
-        // Map to 0 ~ N-1
-        _current_index = abs_index % _page_num;
-        if (_current_index < 0) {
-            _current_index += _page_num;
-        }
+        _current_index = launcher_index_from_scroll(scrollValue, _page_gap, _page_num);
 
         if (_last_index != _current_index) {
             update_dots();
@@ -207,7 +183,8 @@ public:
 
     void jumpTo(int index)
     {
-        if (index < 0 || index >= _icon_label_texts.size()) {
+        index = launcher_logical_index(index, static_cast<int>(_icon_label_texts.size()));
+        if (index < 0) {
             return;
         }
 
@@ -226,17 +203,14 @@ public:
         _last_index = _current_index;
 
         // Calculate current icon index and distance to icon center
-        _current_index        = (scrollValue + _icon_gap / 2) / _icon_gap;
-        int icon_center_pos_x = _current_index * _icon_gap;
+        const int absolute_index = scrollValue >= 0
+            ? (scrollValue + _icon_gap / 2) / _icon_gap
+            : (scrollValue - _icon_gap / 2) / _icon_gap;
+        _current_index = launcher_logical_index(
+            absolute_index, static_cast<int>(_icon_label_texts.size())
+        );
+        int icon_center_pos_x = absolute_index * _icon_gap;
         int distance_to_icon  = std::abs(scrollValue - icon_center_pos_x);
-
-        // Clamp index
-        if (_current_index < 0) {
-            _current_index = 0;
-        }
-        if (_current_index >= _icon_label_texts.size()) {
-            _current_index = _icon_label_texts.size() - 1;
-        }
 
         // Check if label should be visible
         bool should_be_visible = (distance_to_icon <= show_range);
@@ -330,6 +304,18 @@ void LauncherView::init(std::vector<mooncake::AppProps_t> appPorps)
     std::vector<std::string> icon_label_texts;
     std::vector<uint32_t> step_colors;
 
+    // Keep one canonical visual record per real app. The repeated icon copies
+    // below are only a scrolling implementation detail.
+    for (const auto& props : appPorps) {
+        icon_label_texts.push_back(props.info.name);
+
+        uint32_t color = 0xDADADA;
+        if (props.info.userData != nullptr) {
+            color = *static_cast<uint32_t*>(props.info.userData);
+        }
+        step_colors.push_back(color);
+    }
+
     // Loop multiple times to create fake infinite scroll
     for (int loop = 0; loop < _loop_copies; loop++) {
         for (const auto& props : appPorps) {
@@ -349,15 +335,6 @@ void LauncherView::init(std::vector<mooncake::AppProps_t> appPorps)
                 _clicked_app_id          = app_id;
                 _last_clicked_icon_pos_x = pos_x;
             });
-
-            // Keep track of data for helpers
-            icon_label_texts.push_back(props.info.name);
-
-            uint32_t color = 0xDADADA;
-            if (props.info.userData != nullptr) {
-                color = *(uint32_t*)props.info.userData;
-            }
-            step_colors.push_back(color);
 
             // Icon image
             if (props.info.icon != nullptr) {

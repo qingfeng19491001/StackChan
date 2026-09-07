@@ -19,5 +19,12 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/sdkconfig.defaults.local")
     message(STATUS "StackChan: detected sdkconfig.defaults.local, applying overlay")
 endif()
 
+# ESP-IDF projects accumulate hundreds of include directories.  On Windows
+# the resulting compiler invocation exceeds CreateProcess' command-line
+# limit before the firmware can link.  Keep generated response files enabled
+# for include paths so a normal `idf.py build` remains usable on this target.
+set(CMAKE_C_USE_RESPONSE_FILE_FOR_INCLUDES 1)
+set(CMAKE_CXX_USE_RESPONSE_FILE_FOR_INCLUDES 1)
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(stack-chan)

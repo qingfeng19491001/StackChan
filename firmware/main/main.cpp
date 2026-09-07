@@ -41,6 +41,11 @@ extern "C" void app_main(void)
         GetMooncake().installApp(std::make_unique<AppMeeting>());
         GetMooncake().installApp(std::make_unique<AppSetup>());
 
+        // The device WebSocket belongs to the HAL/Mooncake lifetime, not to an
+        // individual screen. This also allows an Auro-initiated meeting to open
+        // AppMeeting automatically after boot.
+        GetHAL().ensureWebSocketAvatarServiceStarted();
+
         // Main loop
         while (1) {
             GetHAL().feedTheDog();

@@ -1,8 +1,33 @@
 diff --git a/main/application.cc b/main/application.cc
-index d69d43d..3b6f07e 100644
+index d69d43d..843cb10 100644
 --- a/main/application.cc
 +++ b/main/application.cc
-@@ -610,33 +610,36 @@ void Application::InitializeProtocol() {
+@@ -70,8 +70,22 @@ void Application::Initialize() {
+ 
+     // Setup the audio service
+     auto codec = board.GetAudioCodec();
+-    audio_service_.Initialize(codec);
+-    audio_service_.Start();
++    const auto audio_init = audio_service_.Initialize(codec);
++    if (audio_init != AudioServiceInitResult::Ok) {
++        ESP_LOGE(TAG, "Audio service initialization failed: %d", static_cast<int>(audio_init));
++        display->SetStatus(Lang::Strings::ERROR);
++        SetDeviceState(kDeviceStateFatalError);
++        return;
++    }
++    const auto audio_start = audio_service_.Start();
++    if (audio_start != AudioServiceStartResult::Started &&
++        audio_start != AudioServiceStartResult::AlreadyStarted) {
++        ESP_LOGE(TAG, "Audio service start failed: %d", static_cast<int>(audio_start));
++        audio_service_.Stop();
++        display->SetStatus(Lang::Strings::ERROR);
++        SetDeviceState(kDeviceStateFatalError);
++        return;
++    }
+ 
+     AudioServiceCallbacks callbacks;
+     callbacks.on_send_queue_available = [this]() {
+@@ -610,33 +624,36 @@ void Application::InitializeProtocol() {
  }
  
  void Application::ShowActivationCode(const std::string& code, const std::string& message) {
@@ -39,7 +64,7 @@ index d69d43d..3b6f07e 100644
 +    // };
 +    // static const std::array<digit_sound, 10> digit_sounds{{
 +    //     digit_sound{'0', Lang::Sounds::OGG_0},
-+    //     digit_sound{'1', Lang::Sounds::OGG_1}, 
++    //     digit_sound{'1', Lang::Sounds::OGG_1},
 +    //     digit_sound{'2', Lang::Sounds::OGG_2},
 +    //     digit_sound{'3', Lang::Sounds::OGG_3},
 +    //     digit_sound{'4', Lang::Sounds::OGG_4},
@@ -66,6 +91,88 @@ index d69d43d..3b6f07e 100644
  }
  
  void Application::Alert(const char* status, const char* message, const char* emotion, const std::string_view& sound) {
+@@ -867,7 +884,11 @@ void Application::HandleStateChangedEvent() {
+             display->SetStatus(Lang::Strings::STANDBY);
+             display->ClearChatMessages();  // Clear messages first
+             display->SetEmotion("neutral"); // Then set emotion (wechat mode checks child count)
+-            audio_service_.EnableVoiceProcessing(false);
++            if (audio_service_.EnableVoiceProcessing(false) ==
++                AudioServiceVoiceResult::ProcessorInitializeFailed) {
++                audio_service_.Stop();
++                SetDeviceState(kDeviceStateFatalError);
++            }
+             audio_service_.EnableWakeWordDetection(true);
+             break;
+         case kDeviceStateConnecting:
+@@ -887,9 +908,17 @@ void Application::HandleStateChangedEvent() {
+                     audio_service_.WaitForPlaybackQueueEmpty();
+                 }
+                 
+-                // Send the start listening command
++                const auto voice_result = audio_service_.EnableVoiceProcessing(true);
++                if (voice_result != AudioServiceVoiceResult::Started &&
++                    voice_result != AudioServiceVoiceResult::AlreadyInState) {
++                    ESP_LOGE(TAG, "Voice processor start failed: %d", static_cast<int>(voice_result));
++                    protocol_->CloseAudioChannel();
++                    audio_service_.Stop();
++                    SetDeviceState(kDeviceStateFatalError);
++                    return;
++                }
++                // Only tell the server to listen after local processing is ready.
+                 protocol_->SendStartListening(listening_mode_);
+-                audio_service_.EnableVoiceProcessing(true);
+             }
+ 
+ #ifdef CONFIG_WAKE_WORD_DETECTION_IN_LISTENING
+@@ -910,16 +939,29 @@ void Application::HandleStateChangedEvent() {
+             display->SetStatus(Lang::Strings::SPEAKING);
+ 
+             if (listening_mode_ != kListeningModeRealtime) {
+-                audio_service_.EnableVoiceProcessing(false);
++                const auto voice_result = audio_service_.EnableVoiceProcessing(false);
++                if (voice_result == AudioServiceVoiceResult::NotInitialized ||
++                    voice_result == AudioServiceVoiceResult::ProcessorInitializeFailed) {
++                    audio_service_.Stop();
++                    SetDeviceState(kDeviceStateFatalError);
++                    return;
++                }
+                 // Only AFE wake word can be detected in speaking mode
+                 audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+             }
+             audio_service_.ResetDecoder();
+             break;
+-        case kDeviceStateWifiConfiguring:
+-            audio_service_.EnableVoiceProcessing(false);
++        case kDeviceStateWifiConfiguring: {
++            const auto voice_result = audio_service_.EnableVoiceProcessing(false);
++            if (voice_result == AudioServiceVoiceResult::NotInitialized ||
++                voice_result == AudioServiceVoiceResult::ProcessorInitializeFailed) {
++                audio_service_.Stop();
++                SetDeviceState(kDeviceStateFatalError);
++                return;
++            }
+             audio_service_.EnableWakeWordDetection(false);
+             break;
++        }
+         default:
+             // Do nothing
+             break;
+@@ -1001,7 +1043,14 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
+     if (!upgrade_success) {
+         // Upgrade failed, restart audio service and continue running
+         ESP_LOGE(TAG, "Firmware upgrade failed, restarting audio service and continuing operation...");
+-        audio_service_.Start(); // Restart audio service
++        const auto restart_result = audio_service_.Start(); // Restart audio service
++        if (restart_result != AudioServiceStartResult::Started &&
++            restart_result != AudioServiceStartResult::AlreadyStarted) {
++            ESP_LOGE(TAG, "Failed to restart audio service after OTA failure: %d",
++                     static_cast<int>(restart_result));
++            SetDeviceState(kDeviceStateFatalError);
++            return false;
++        }
+         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER); // Restore power save level
+         Alert(Lang::Strings::ERROR, Lang::Strings::UPGRADE_FAILED, "circle_xmark", Lang::Sounds::OGG_EXCLAMATION);
+         vTaskDelay(pdMS_TO_TICKS(3000));
 diff --git a/main/assets.cc b/main/assets.cc
 index ad61944..6b84daf 100644
 --- a/main/assets.cc
@@ -245,6 +352,1935 @@ index 3692e0c..7bfbc5c 100644
      
      // Strategy instance
      std::unique_ptr<AssetStrategy> strategy_;
+diff --git a/main/audio/audio_lifecycle_policy.h b/main/audio/audio_lifecycle_policy.h
+new file mode 100644
+index 0000000..6b5d497
+--- /dev/null
++++ b/main/audio/audio_lifecycle_policy.h
+@@ -0,0 +1,79 @@
++#ifndef AUDIO_LIFECYCLE_POLICY_H
++#define AUDIO_LIFECYCLE_POLICY_H
++
++enum class AudioWorker : unsigned char {
++    Input = 1U << 0,
++    Output = 1U << 1,
++    Codec = 1U << 2,
++};
++
++class AudioLifecyclePolicy {
++public:
++    void OpenIntake() { accepting_input_ = true; }
++    void CloseIntake() { accepting_input_ = false; }
++
++    bool TryBeginInputWork()
++    {
++        if (!accepting_input_) {
++            return false;
++        }
++        input_work_active_ = true;
++        return true;
++    }
++
++    void EndInputWork() { input_work_active_ = false; }
++    bool InputQuiescent() const { return !input_work_active_; }
++
++    bool TryBeginEncoderWork()
++    {
++        if (encoder_work_active_) {
++            return false;
++        }
++        encoder_work_active_ = true;
++        return true;
++    }
++
++    void EndEncoderWork() { encoder_work_active_ = false; }
++
++    bool ProducersQuiescent(bool encode_queue_empty) const
++    {
++        return !accepting_input_ && !input_work_active_ && !encoder_work_active_ &&
++            encode_queue_empty;
++    }
++
++    void ResetWorkers()
++    {
++        created_workers_ = 0;
++        exited_workers_ = 0;
++        accepting_input_ = false;
++        input_work_active_ = false;
++        encoder_work_active_ = false;
++    }
++
++    void MarkWorkerCreated(AudioWorker worker) { created_workers_ |= Mask(worker); }
++    void MarkWorkerExited(AudioWorker worker) { exited_workers_ |= Mask(worker); }
++
++    bool AllWorkersExited() const
++    {
++        return (exited_workers_ & created_workers_) == created_workers_;
++    }
++
++    bool CanDestroy() const
++    {
++        return !input_work_active_ && !encoder_work_active_ && AllWorkersExited();
++    }
++
++private:
++    static constexpr unsigned char Mask(AudioWorker worker)
++    {
++        return static_cast<unsigned char>(worker);
++    }
++
++    bool accepting_input_ = false;
++    bool input_work_active_ = false;
++    bool encoder_work_active_ = false;
++    unsigned char created_workers_ = 0;
++    unsigned char exited_workers_ = 0;
++};
++
++#endif
+diff --git a/main/audio/audio_lifecycle_state.h b/main/audio/audio_lifecycle_state.h
+new file mode 100644
+index 0000000..245bcb2
+--- /dev/null
++++ b/main/audio/audio_lifecycle_state.h
+@@ -0,0 +1,93 @@
++#ifndef AUDIO_LIFECYCLE_STATE_H
++#define AUDIO_LIFECYCLE_STATE_H
++
++#include <mutex>
++
++#include "audio_lifecycle_policy.h"
++
++class AudioLifecycleState {
++public:
++    void OpenIntake()
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        policy_.OpenIntake();
++    }
++
++    void CloseIntake()
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        policy_.CloseIntake();
++    }
++
++    bool TryBeginInputWork()
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        return policy_.TryBeginInputWork();
++    }
++
++    void EndInputWork()
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        policy_.EndInputWork();
++    }
++
++    bool InputQuiescent() const
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        return policy_.InputQuiescent();
++    }
++
++    bool TryBeginEncoderWork()
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        return policy_.TryBeginEncoderWork();
++    }
++
++    void EndEncoderWork()
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        policy_.EndEncoderWork();
++    }
++
++    bool ProducersQuiescent(bool encode_queue_empty) const
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        return policy_.ProducersQuiescent(encode_queue_empty);
++    }
++
++    void ResetWorkers()
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        policy_.ResetWorkers();
++    }
++
++    void MarkWorkerCreated(AudioWorker worker)
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        policy_.MarkWorkerCreated(worker);
++    }
++
++    void MarkWorkerExited(AudioWorker worker)
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        policy_.MarkWorkerExited(worker);
++    }
++
++    bool AllWorkersExited() const
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        return policy_.AllWorkersExited();
++    }
++
++    bool CanDestroy() const
++    {
++        std::lock_guard<std::mutex> lock(mutex_);
++        return policy_.CanDestroy();
++    }
++
++private:
++    mutable std::mutex mutex_;
++    AudioLifecyclePolicy policy_;
++};
++
++#endif
+diff --git a/main/audio/audio_output_dispatch_policy.h b/main/audio/audio_output_dispatch_policy.h
+new file mode 100644
+index 0000000..2b3ad8f
+--- /dev/null
++++ b/main/audio/audio_output_dispatch_policy.h
+@@ -0,0 +1,42 @@
++#ifndef AUDIO_OUTPUT_DISPATCH_POLICY_H
++#define AUDIO_OUTPUT_DISPATCH_POLICY_H
++
++class AudioOutputDispatchPolicy {
++public:
++    void DetachFrames(unsigned count) {
++        detached_frames_ += count;
++    }
++
++    bool BeginCallback() {
++        if (detached_frames_ == 0) {
++            return false;
++        }
++        --detached_frames_;
++        ++active_callbacks_;
++        return true;
++    }
++
++    void EndCallback() {
++        if (active_callbacks_ != 0) {
++            --active_callbacks_;
++        }
++    }
++
++    bool IsQuiescent() const {
++        return detached_frames_ == 0 && active_callbacks_ == 0;
++    }
++
++private:
++    unsigned detached_frames_ = 0;
++    unsigned active_callbacks_ = 0;
++};
++
++constexpr bool CanDeclareAudioDrain(
++    bool lifecycle_quiescent,
++    bool send_queue_empty,
++    bool processor_output_quiescent
++) {
++    return lifecycle_quiescent && send_queue_empty && processor_output_quiescent;
++}
++
++#endif
+diff --git a/main/audio/audio_processor.h b/main/audio/audio_processor.h
+index 543c7ae..74d3e00 100644
+--- a/main/audio/audio_processor.h
++++ b/main/audio/audio_processor.h
+@@ -4,18 +4,33 @@
+ #include <string>
+ #include <vector>
+ #include <functional>
++#include <cstdint>
+ 
+ #include <model_path.h>
+ #include "audio_codec.h"
+ 
++enum class AudioProcessorStopResult {
++    Complete = 0,
++    IncompleteTail,
++    NotInitialized,
++};
++
++enum class AudioProcessorShutdownResult {
++    Complete = 0,
++    TaskJoinTimeout,
++};
++
+ class AudioProcessor {
+ public:
+     virtual ~AudioProcessor() = default;
+     
+-    virtual void Initialize(AudioCodec* codec, int frame_duration_ms, srmodel_list_t* models_list) = 0;
++    virtual bool Initialize(AudioCodec* codec, int frame_duration_ms, srmodel_list_t* models_list) = 0;
+     virtual void Feed(std::vector<int16_t>&& data) = 0;
+     virtual void Start() = 0;
+-    virtual void Stop() = 0;
++    virtual AudioProcessorStopResult Stop() = 0;
++    virtual AudioProcessorShutdownResult Shutdown(uint32_t timeout_ms) = 0;
++    virtual bool CanDestroy() const = 0;
++    virtual bool IsOutputQuiescent() const = 0;
+     virtual bool IsRunning() = 0;
+     virtual void OnOutput(std::function<void(std::vector<int16_t>&& data)> callback) = 0;
+     virtual void OnVadStateChange(std::function<void(bool speaking)> callback) = 0;
+diff --git a/main/audio/audio_runtime_state.h b/main/audio/audio_runtime_state.h
+new file mode 100644
+index 0000000..3c27bc9
+--- /dev/null
++++ b/main/audio/audio_runtime_state.h
+@@ -0,0 +1,75 @@
++#ifndef AUDIO_RUNTIME_STATE_H
++#define AUDIO_RUNTIME_STATE_H
++
++enum class AudioRuntimeDrainDisposition {
++    Complete = 0,
++    IncompleteProcessorTail,
++    EncodeFailed,
++};
++
++class AudioRuntimeState {
++public:
++    bool BeginStart()
++    {
++        if (start_active_) {
++            return false;
++        }
++        start_active_ = true;
++        timer_running_ = false;
++        encode_failed_ = false;
++        capture_metadata_pending_ = false;
++        return true;
++    }
++
++    void MarkTimerStarted() { timer_running_ = true; }
++    void MarkTimerStopped() { timer_running_ = false; }
++
++    void RollbackStart()
++    {
++        start_active_ = false;
++        timer_running_ = false;
++        encode_failed_ = false;
++        capture_metadata_pending_ = false;
++    }
++
++    void MarkEncodeFailed() { encode_failed_ = true; }
++    bool EncodeFailed() const { return encode_failed_; }
++
++    void MarkProcessorPrepared() { processor_prepared_ = true; }
++    void MarkProcessorReleased() { processor_prepared_ = false; }
++    bool ProcessorPrepared() const { return processor_prepared_; }
++
++    void MarkCaptureMetadataPending() { capture_metadata_pending_ = true; }
++    void ClearCaptureMetadata() { capture_metadata_pending_ = false; }
++    bool CaptureMetadataPending() const { return capture_metadata_pending_; }
++
++    void ResetAfterStop()
++    {
++        start_active_ = false;
++        timer_running_ = false;
++        encode_failed_ = false;
++        capture_metadata_pending_ = false;
++    }
++
++    bool StartActive() const { return start_active_; }
++    bool TimerRunning() const { return timer_running_; }
++
++    AudioRuntimeDrainDisposition ResolveDrain(bool incomplete_processor_tail) const
++    {
++        if (encode_failed_) {
++            return AudioRuntimeDrainDisposition::EncodeFailed;
++        }
++        return incomplete_processor_tail
++            ? AudioRuntimeDrainDisposition::IncompleteProcessorTail
++            : AudioRuntimeDrainDisposition::Complete;
++    }
++
++private:
++    bool start_active_ = false;
++    bool timer_running_ = false;
++    bool encode_failed_ = false;
++    bool capture_metadata_pending_ = false;
++    bool processor_prepared_ = false;
++};
++
++#endif
+diff --git a/main/audio/audio_service.cc b/main/audio/audio_service.cc
+index 350ac58..68b6735 100644
+--- a/main/audio/audio_service.cc
++++ b/main/audio/audio_service.cc
+@@ -1,4 +1,6 @@
+ #include "audio_service.h"
++#include "audio_output_dispatch_policy.h"
++#include "audio_worker_startup_policy.h"
+ #include <esp_log.h>
+ #include <cstring>
+ 
+@@ -24,9 +26,8 @@
+ 
+ #if CONFIG_USE_AUDIO_PROCESSOR
+ #include "processors/afe_audio_processor.h"
+-#else
+-#include "processors/no_audio_processor.h"
+ #endif
++#include "processors/no_audio_processor.h"
+ 
+ #if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32P4
+ #include "wake_words/afe_wake_word.h"
+@@ -37,11 +38,25 @@
+ 
+ #define TAG "AudioService"
+ 
+-AudioService::AudioService() {
++AudioService::AudioService(bool force_no_audio_processor)
++    : force_no_audio_processor_(force_no_audio_processor) {
+     event_group_ = xEventGroupCreate();
+ }
+ 
+ AudioService::~AudioService() {
++    Stop();
++    while (!CanDestroy()) {
++        ESP_LOGE(TAG, "Audio workers still live during destruction; retaining resources and waiting");
++        RequestWorkersStop();
++        JoinWorkersAndProcessor(esp_timer_get_time() + 1000000);
++    }
++    audio_processor_.reset();
++    wake_word_.reset();
++    if (audio_power_timer_ != nullptr) {
++        esp_timer_stop(audio_power_timer_);
++        esp_timer_delete(audio_power_timer_);
++        audio_power_timer_ = nullptr;
++    }
+     if (event_group_ != nullptr) {
+         vEventGroupDelete(event_group_);
+     }
+@@ -59,7 +74,13 @@ AudioService::~AudioService() {
+     }
+ }
+ 
+-void AudioService::Initialize(AudioCodec* codec) {
++AudioServiceInitResult AudioService::Initialize(AudioCodec* codec) {
++    if (codec == nullptr || event_group_ == nullptr) {
++        return AudioServiceInitResult::InvalidCodec;
++    }
++    if (initialized_) {
++        return AudioServiceInitResult::Ok;
++    }
+     codec_ = codec;
+     codec_->Start();
+ 
+@@ -67,6 +88,8 @@ void AudioService::Initialize(AudioCodec* codec) {
+     auto ret = esp_opus_dec_open(&opus_dec_cfg, sizeof(esp_opus_dec_cfg_t), &opus_decoder_);
+     if (opus_decoder_ == nullptr) {
+         ESP_LOGE(TAG, "Failed to create audio decoder, error code: %d", ret);
++        RollbackInitialization();
++        return AudioServiceInitResult::DecoderFailed;
+     } else {
+         decoder_sample_rate_ = codec->output_sample_rate();
+         decoder_duration_ms_ = OPUS_FRAME_DURATION_MS;
+@@ -76,6 +99,8 @@ void AudioService::Initialize(AudioCodec* codec) {
+     ret = esp_opus_enc_open(&opus_enc_cfg, sizeof(esp_opus_enc_config_t), &opus_encoder_);
+     if (opus_encoder_ == nullptr) {
+         ESP_LOGE(TAG, "Failed to create audio encoder, error code: %d", ret);
++        RollbackInitialization();
++        return AudioServiceInitResult::EncoderFailed;
+     } else {
+         encoder_sample_rate_ = 16000;
+         encoder_duration_ms_ = OPUS_FRAME_DURATION_MS;
+@@ -89,17 +114,26 @@ void AudioService::Initialize(AudioCodec* codec) {
+         auto resampler_ret = esp_ae_rate_cvt_open(&input_resampler_cfg, &input_resampler_);
+         if (input_resampler_ == nullptr) {
+             ESP_LOGE(TAG, "Failed to create input resampler, error code: %d", resampler_ret);
++            RollbackInitialization();
++            return AudioServiceInitResult::InputResamplerFailed;
+         }
+     }
+ 
+ #if CONFIG_USE_AUDIO_PROCESSOR
+-    audio_processor_ = std::make_unique<AfeAudioProcessor>();
++    if (!force_no_audio_processor_) {
++        audio_processor_ = std::make_unique<AfeAudioProcessor>();
++    } else {
++        audio_processor_ = std::make_unique<NoAudioProcessor>();
++    }
+ #else
+     audio_processor_ = std::make_unique<NoAudioProcessor>();
+ #endif
+ 
+     audio_processor_->OnOutput([this](std::vector<int16_t>&& data) {
+-        PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
++        const uint64_t capture_timestamp_ms = ConsumeCaptureTimestamp(data.size());
++        PushTaskToEncodeQueue(
++            kAudioTaskTypeEncodeToSendQueue, std::move(data), capture_timestamp_ms
++        );
+     });
+ 
+     audio_processor_->OnVadStateChange([this](bool speaking) {
+@@ -119,66 +153,398 @@ void AudioService::Initialize(AudioCodec* codec) {
+         .name = "audio_power_timer",
+         .skip_unhandled_events = true,
+     };
+-    esp_timer_create(&audio_power_timer_args, &audio_power_timer_);
++    if (esp_timer_create(&audio_power_timer_args, &audio_power_timer_) != ESP_OK) {
++        RollbackInitialization();
++        return AudioServiceInitResult::TimerFailed;
++    }
++    initialized_ = true;
++    return AudioServiceInitResult::Ok;
+ }
+ 
+-void AudioService::Start() {
++AudioServiceStartResult AudioService::Start() {
++    if (!initialized_) {
++        return AudioServiceStartResult::NotInitialized;
++    }
++    if (shutdown_failure_latched_) {
++        return AudioServiceStartResult::ShutdownFailureLatched;
++    }
++    if (!service_stopped_) {
++        return AudioServiceStartResult::AlreadyStarted;
++    }
++    {
++        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++        capture_segments_.clear();
++        if (!runtime_state_.BeginStart()) {
++            shutdown_failure_latched_ = true;
++            return AudioServiceStartResult::ShutdownFailureLatched;
++        }
++    }
++    lifecycle_.ResetWorkers();
+     service_stopped_ = false;
+-    xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING);
+-
+-    esp_timer_start_periodic(audio_power_timer_, 1000000);
++    drain_started_ = false;
++    lifecycle_.OpenIntake();
++    xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING | AS_EVENT_WAKE_WORD_RUNNING |
++        AS_EVENT_AUDIO_PROCESSOR_RUNNING | AS_EVENT_INPUT_TASK_EXITED | AS_EVENT_OUTPUT_TASK_EXITED |
++        AS_EVENT_CODEC_TASK_EXITED);
++
++    if (esp_timer_start_periodic(audio_power_timer_, 1000000) != ESP_OK) {
++        service_stopped_ = true;
++        lifecycle_.CloseIntake();
++        const auto cleanup = JoinWorkersAndProcessor(esp_timer_get_time() + 3000000);
++        runtime_state_.RollbackStart();
++        if (cleanup != AudioServiceStopResult::Complete) {
++            shutdown_failure_latched_ = true;
++            return AudioServiceStartResult::RollbackJoinTimeout;
++        }
++        return AudioServiceStartResult::TaskCreationFailed;
++    }
++    runtime_state_.MarkTimerStarted();
+ 
++    const auto startup_result = StartAudioWorkers(
++        [this]() {
++#if CONFIG_USE_AUDIO_PROCESSOR
++            const BaseType_t result = xTaskCreatePinnedToCore([](void* arg) {
++                AudioService* audio_service = (AudioService*)arg;
++                audio_service->AudioInputTask();
++                vTaskDelete(NULL);
++            }, "audio_input", 2048 * 3, this, 8, &audio_input_task_handle_, 0);
++#else
++            const BaseType_t result = xTaskCreate([](void* arg) {
++                AudioService* audio_service = (AudioService*)arg;
++                audio_service->AudioInputTask();
++                vTaskDelete(NULL);
++            }, "audio_input", 2048 * 2, this, 8, &audio_input_task_handle_);
++#endif
++            if (result == pdPASS) {
++                lifecycle_.MarkWorkerCreated(AudioWorker::Input);
++            }
++            return result == pdPASS;
++        },
++        [this]() {
+ #if CONFIG_USE_AUDIO_PROCESSOR
+-    /* Start the audio input task */
+-    xTaskCreatePinnedToCore([](void* arg) {
+-        AudioService* audio_service = (AudioService*)arg;
+-        audio_service->AudioInputTask();
+-        vTaskDelete(NULL);
+-    }, "audio_input", 2048 * 3, this, 8, &audio_input_task_handle_, 0);
+-
+-    /* Start the audio output task */
+-    xTaskCreate([](void* arg) {
+-        AudioService* audio_service = (AudioService*)arg;
+-        audio_service->AudioOutputTask();
+-        vTaskDelete(NULL);
+-    }, "audio_output", 2048 * 2, this, 4, &audio_output_task_handle_);
++            const uint32_t stack_depth = 2048 * 2;
+ #else
+-    /* Start the audio input task */
+-    xTaskCreate([](void* arg) {
+-        AudioService* audio_service = (AudioService*)arg;
+-        audio_service->AudioInputTask();
+-        vTaskDelete(NULL);
+-    }, "audio_input", 2048 * 2, this, 8, &audio_input_task_handle_);
+-
+-    /* Start the audio output task */
+-    xTaskCreate([](void* arg) {
+-        AudioService* audio_service = (AudioService*)arg;
+-        audio_service->AudioOutputTask();
+-        vTaskDelete(NULL);
+-    }, "audio_output", 2048, this, 4, &audio_output_task_handle_);
++            const uint32_t stack_depth = 2048;
+ #endif
++            const BaseType_t result = xTaskCreate([](void* arg) {
++                AudioService* audio_service = (AudioService*)arg;
++                audio_service->AudioOutputTask();
++                vTaskDelete(NULL);
++            }, "audio_output", stack_depth, this, 4, &audio_output_task_handle_);
++            if (result == pdPASS) {
++                lifecycle_.MarkWorkerCreated(AudioWorker::Output);
++            }
++            return result == pdPASS;
++        },
++        [this]() {
++            const BaseType_t result = xTaskCreate([](void* arg) {
++                AudioService* audio_service = (AudioService*)arg;
++                audio_service->OpusCodecTask();
++                vTaskDelete(NULL);
++            }, "opus_codec", 2048 * 12, this, 2, &opus_codec_task_handle_);
++            if (result == pdPASS) {
++                lifecycle_.MarkWorkerCreated(AudioWorker::Codec);
++            }
++            return result == pdPASS;
++        },
++        [this]() {
++            ESP_LOGE(TAG, "Failed to create one or more audio tasks");
++            esp_timer_stop(audio_power_timer_);
++            runtime_state_.MarkTimerStopped();
++            RequestWorkersStop();
++            const auto cleanup = JoinWorkersAndProcessor(esp_timer_get_time() + 3000000);
++            if (cleanup != AudioServiceStopResult::Complete) {
++                shutdown_failure_latched_ = true;
++                return false;
++            }
++            runtime_state_.RollbackStart();
++            return true;
++        }
++    );
++    switch (startup_result) {
++        case AudioWorkerStartupResult::Started:
++            return AudioServiceStartResult::Started;
++        case AudioWorkerStartupResult::CreationFailed:
++            return AudioServiceStartResult::TaskCreationFailed;
++        case AudioWorkerStartupResult::RollbackFailed:
++            return AudioServiceStartResult::RollbackJoinTimeout;
++    }
++    return AudioServiceStartResult::RollbackJoinTimeout;
++}
++
++AudioServiceStopResult AudioService::Stop(uint32_t timeout_ms) {
++    return StopInternal(false, timeout_ms);
++}
++
++AudioServiceStopResult AudioService::StopAndDrain(uint32_t timeout_ms) {
++    return StopInternal(true, timeout_ms);
++}
++
++AudioServiceStopResult AudioService::StopInternal(bool drain, uint32_t timeout_ms) {
++    if (service_stopped_ && audio_input_task_handle_ == nullptr &&
++        audio_output_task_handle_ == nullptr && opus_codec_task_handle_ == nullptr) {
++        return AudioServiceStopResult::NotStarted;
++    }
++
++    const int64_t deadline_us = esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 1000;
++    if (drain) {
++        const auto drain_result = BeginDrain(timeout_ms);
++        const int64_t remaining_us = deadline_us - esp_timer_get_time();
++        const auto finish_result = FinishStop(
++            remaining_us > 0 ? static_cast<uint32_t>(remaining_us / 1000) : 0
++        );
++        if (finish_result != AudioServiceStopResult::Complete) {
++            return finish_result;
++        }
++        switch (drain_result) {
++            case AudioServiceDrainResult::Complete:
++                return AudioServiceStopResult::Complete;
++            case AudioServiceDrainResult::IncompleteProcessorTail:
++                return AudioServiceStopResult::IncompleteAudio;
++            case AudioServiceDrainResult::EncoderFailed:
++                return AudioServiceStopResult::EncodeFailed;
++            case AudioServiceDrainResult::InputQuiesceTimeout:
++                return AudioServiceStopResult::InputQuiesceTimeout;
++            case AudioServiceDrainResult::EncoderDrainTimeout:
++                return AudioServiceStopResult::DrainTimeout;
++            case AudioServiceDrainResult::NotStarted:
++                return AudioServiceStopResult::NotStarted;
++        }
++    }
++
++    if (audio_power_timer_ != nullptr) {
++        esp_timer_stop(audio_power_timer_);
++        runtime_state_.MarkTimerStopped();
++    }
++    lifecycle_.CloseIntake();
++    xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING |
++        AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING);
++    if (wake_word_ != nullptr) {
++        wake_word_->Stop();
++    }
++    const bool input_quiescent = WaitForInputQuiescence(deadline_us);
++    bool incomplete_audio = !input_quiescent;
++    if (input_quiescent && audio_processor_ != nullptr && runtime_state_.ProcessorPrepared()) {
++        incomplete_audio = audio_processor_->Stop() == AudioProcessorStopResult::IncompleteTail;
++    }
++    RequestWorkersStop();
++    const auto join_result = JoinWorkersAndProcessor(deadline_us);
++    if (join_result != AudioServiceStopResult::Complete) {
++        shutdown_failure_latched_ = true;
++        return join_result;
++    }
++    {
++        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++        incomplete_audio = incomplete_audio || !audio_encode_queue_.empty() || !audio_send_queue_.empty();
++        incomplete_audio = incomplete_audio || runtime_state_.EncodeFailed();
++        audio_encode_queue_.clear();
++        audio_send_queue_.clear();
++        audio_decode_queue_.clear();
++        audio_playback_queue_.clear();
++        audio_testing_queue_.clear();
++        timestamp_queue_.clear();
++        capture_segments_.clear();
++        runtime_state_.ClearCaptureMetadata();
++        audio_queue_cv_.notify_all();
++    }
++    if (codec_ != nullptr) {
++        codec_->EnableInput(false);
++    }
++    drain_started_ = false;
++    runtime_state_.ResetAfterStop();
++    return incomplete_audio ? AudioServiceStopResult::IncompleteAudio
++                            : AudioServiceStopResult::Complete;
++}
++
++AudioServiceDrainResult AudioService::BeginDrain(uint32_t timeout_ms) {
++    if (service_stopped_) {
++        return AudioServiceDrainResult::NotStarted;
++    }
++    const int64_t deadline_us = esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 1000;
++    if (audio_power_timer_ != nullptr) {
++        esp_timer_stop(audio_power_timer_);
++        runtime_state_.MarkTimerStopped();
++    }
++    lifecycle_.CloseIntake();
++    xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING |
++        AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING);
++    if (wake_word_ != nullptr) {
++        wake_word_->Stop();
++    }
++    audio_queue_cv_.notify_all();
++    if (!WaitForInputQuiescence(deadline_us)) {
++        return AudioServiceDrainResult::InputQuiesceTimeout;
++    }
++
++    bool incomplete_tail = false;
++    if (audio_processor_ != nullptr && runtime_state_.ProcessorPrepared()) {
++        incomplete_tail = audio_processor_->Stop() == AudioProcessorStopResult::IncompleteTail;
++    }
++    if (!WaitForEncoderQuiescence(deadline_us)) {
++        return AudioServiceDrainResult::EncoderDrainTimeout;
++    }
++    drain_started_ = true;
++    {
++        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++        switch (runtime_state_.ResolveDrain(incomplete_tail)) {
++            case AudioRuntimeDrainDisposition::Complete:
++                return AudioServiceDrainResult::Complete;
++            case AudioRuntimeDrainDisposition::IncompleteProcessorTail:
++                return AudioServiceDrainResult::IncompleteProcessorTail;
++            case AudioRuntimeDrainDisposition::EncodeFailed:
++                return AudioServiceDrainResult::EncoderFailed;
++        }
++    }
++    return AudioServiceDrainResult::EncoderFailed;
++}
++
++AudioServiceStopResult AudioService::FinishStop(uint32_t timeout_ms) {
++    if (service_stopped_ && audio_input_task_handle_ == nullptr &&
++        audio_output_task_handle_ == nullptr && opus_codec_task_handle_ == nullptr) {
++        return AudioServiceStopResult::NotStarted;
++    }
++    if (!drain_started_) {
++        return StopInternal(false, timeout_ms);
++    }
++    const int64_t deadline_us = esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 1000;
++    RequestWorkersStop();
++    const auto result = JoinWorkersAndProcessor(deadline_us);
++    if (result != AudioServiceStopResult::Complete) {
++        shutdown_failure_latched_ = true;
++        return result;
++    }
++    if (codec_ != nullptr) {
++        codec_->EnableInput(false);
++    }
++    {
++        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++        capture_segments_.clear();
++        runtime_state_.ResetAfterStop();
++    }
++    drain_started_ = false;
++    return AudioServiceStopResult::Complete;
++}
++
++bool AudioService::WaitForInputQuiescence(int64_t deadline_us) {
++    while (!lifecycle_.InputQuiescent()) {
++        if (esp_timer_get_time() >= deadline_us) {
++            return false;
++        }
++        vTaskDelay(pdMS_TO_TICKS(1));
++    }
++    return true;
++}
+ 
+-    /* Start the opus codec task */
+-    xTaskCreate([](void* arg) {
+-        AudioService* audio_service = (AudioService*)arg;
+-        audio_service->OpusCodecTask();
+-        vTaskDelete(NULL);
+-    }, "opus_codec", 2048 * 12, this, 2, &opus_codec_task_handle_);
++bool AudioService::WaitForEncoderQuiescence(int64_t deadline_us) {
++    while (true) {
++        {
++            std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++            if (CanDeclareAudioDrain(
++                    lifecycle_.ProducersQuiescent(audio_encode_queue_.empty()),
++                    audio_send_queue_.empty(),
++                    audio_processor_ == nullptr || audio_processor_->IsOutputQuiescent()
++                )) {
++                return true;
++            }
++            audio_queue_cv_.notify_all();
++        }
++        if (esp_timer_get_time() >= deadline_us) {
++            return false;
++        }
++        vTaskDelay(pdMS_TO_TICKS(1));
++    }
+ }
+ 
+-void AudioService::Stop() {
+-    esp_timer_stop(audio_power_timer_);
++void AudioService::RequestWorkersStop() {
++    lifecycle_.CloseIntake();
+     service_stopped_ = true;
++    {
++        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++        audio_queue_cv_.notify_all();
++    }
+     xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_TESTING_RUNNING |
+-        AS_EVENT_WAKE_WORD_RUNNING |
+-        AS_EVENT_AUDIO_PROCESSOR_RUNNING);
++        AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING);
++}
+ 
+-    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+-    audio_encode_queue_.clear();
+-    audio_decode_queue_.clear();
+-    audio_playback_queue_.clear();
+-    audio_testing_queue_.clear();
+-    audio_queue_cv_.notify_all();
++AudioServiceStopResult AudioService::JoinWorkersAndProcessor(int64_t deadline_us) {
++    EventBits_t task_exit_mask = 0;
++    if (audio_input_task_handle_ != nullptr) {
++        task_exit_mask |= AS_EVENT_INPUT_TASK_EXITED;
++    }
++    if (audio_output_task_handle_ != nullptr) {
++        task_exit_mask |= AS_EVENT_OUTPUT_TASK_EXITED;
++    }
++    if (opus_codec_task_handle_ != nullptr) {
++        task_exit_mask |= AS_EVENT_CODEC_TASK_EXITED;
++    }
++    if (task_exit_mask != 0) {
++        const int64_t remaining_us = deadline_us - esp_timer_get_time();
++        const TickType_t wait_ticks = remaining_us > 0
++            ? pdMS_TO_TICKS(static_cast<uint32_t>(remaining_us / 1000))
++            : 0;
++        const EventBits_t exited = xEventGroupWaitBits(
++            event_group_, task_exit_mask, pdFALSE, pdTRUE, wait_ticks
++        );
++        if ((exited & task_exit_mask) != task_exit_mask) {
++            ESP_LOGE(TAG, "Timed out joining audio tasks");
++            return AudioServiceStopResult::TaskJoinTimeout;
++        }
++    }
++    audio_input_task_handle_ = nullptr;
++    audio_output_task_handle_ = nullptr;
++    opus_codec_task_handle_ = nullptr;
++
++    // The input task can be inside AudioProcessor::Feed(). Join it before
++    // destroying any processor state that Feed may still reference.
++    if (audio_processor_ != nullptr && runtime_state_.ProcessorPrepared()) {
++        const int64_t remaining_us = deadline_us - esp_timer_get_time();
++        const auto processor_result = audio_processor_->Shutdown(
++            remaining_us > 0 ? static_cast<uint32_t>(remaining_us / 1000) : 0
++        );
++        if (processor_result != AudioProcessorShutdownResult::Complete) {
++            return AudioServiceStopResult::ProcessorJoinTimeout;
++        }
++        runtime_state_.MarkProcessorReleased();
++    }
++    return AudioServiceStopResult::Complete;
++}
++
++bool AudioService::CanDestroy() const {
++    return audio_input_task_handle_ == nullptr && audio_output_task_handle_ == nullptr &&
++        opus_codec_task_handle_ == nullptr && lifecycle_.CanDestroy() &&
++        (audio_processor_ == nullptr || audio_processor_->CanDestroy());
++}
++
++void AudioService::RollbackInitialization() {
++    audio_processor_.reset();
++    wake_word_.reset();
++    if (audio_power_timer_ != nullptr) {
++        esp_timer_stop(audio_power_timer_);
++        esp_timer_delete(audio_power_timer_);
++        audio_power_timer_ = nullptr;
++    }
++    if (opus_encoder_ != nullptr) {
++        esp_opus_enc_close(opus_encoder_);
++        opus_encoder_ = nullptr;
++    }
++    if (opus_decoder_ != nullptr) {
++        esp_opus_dec_close(opus_decoder_);
++        opus_decoder_ = nullptr;
++    }
++    if (input_resampler_ != nullptr) {
++        esp_ae_rate_cvt_close(input_resampler_);
++        input_resampler_ = nullptr;
++    }
++    if (output_resampler_ != nullptr) {
++        esp_ae_rate_cvt_close(output_resampler_);
++        output_resampler_ = nullptr;
++    }
++    if (codec_ != nullptr) {
++        codec_->EnableInput(false);
++        codec_->EnableOutput(false);
++    }
++    codec_ = nullptr;
++    initialized_ = false;
+ }
+ 
+ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples) {
+@@ -236,55 +602,77 @@ void AudioService::AudioInputTask() {
+         if (service_stopped_) {
+             break;
+         }
++        if (!lifecycle_.TryBeginInputWork()) {
++            continue;
++        }
++
++        bool handled = false;
+         if (audio_input_need_warmup_) {
+             audio_input_need_warmup_ = false;
+             vTaskDelay(pdMS_TO_TICKS(120));
+-            continue;
++            handled = true;
+         }
+ 
+         /* Used for audio testing in NetworkConfiguring mode by clicking the BOOT button */
+-        if (bits & AS_EVENT_AUDIO_TESTING_RUNNING) {
++        if (!handled && (bits & AS_EVENT_AUDIO_TESTING_RUNNING)) {
+             if (audio_testing_queue_.size() >= AUDIO_TESTING_MAX_DURATION_MS / OPUS_FRAME_DURATION_MS) {
+                 ESP_LOGW(TAG, "Audio testing queue is full, stopping audio testing");
+                 EnableAudioTesting(false);
+-                continue;
++                handled = true;
+             }
+-            std::vector<int16_t> data;
+-            int samples = OPUS_FRAME_DURATION_MS * 16000 / 1000;
+-            if (ReadAudioData(data, 16000, samples)) {
++            if (!handled) {
++                std::vector<int16_t> data;
++                int samples = OPUS_FRAME_DURATION_MS * 16000 / 1000;
++                const uint64_t capture_timestamp_ms = esp_timer_get_time() / 1000;
++                if (ReadAudioData(data, 16000, samples)) {
+                 // If input channels is 2, we need to fetch the left channel data
+-                if (codec_->input_channels() == 2) {
+-                    auto mono_data = std::vector<int16_t>(data.size() / 2);
+-                    for (size_t i = 0, j = 0; i < mono_data.size(); ++i, j += 2) {
+-                        mono_data[i] = data[j];
++                    if (codec_->input_channels() == 2) {
++                        auto mono_data = std::vector<int16_t>(data.size() / 2);
++                        for (size_t i = 0, j = 0; i < mono_data.size(); ++i, j += 2) {
++                            mono_data[i] = data[j];
++                        }
++                        data = std::move(mono_data);
+                     }
+-                    data = std::move(mono_data);
++                    PushTaskToEncodeQueue(
++                        kAudioTaskTypeEncodeToTestingQueue, std::move(data), capture_timestamp_ms
++                    );
++                    handled = true;
+                 }
+-                PushTaskToEncodeQueue(kAudioTaskTypeEncodeToTestingQueue, std::move(data));
+-                continue;
+             }
+         }
+ 
+         /* Feed the wake word and/or audio processor */
+-        if (bits & (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING)) {
++        if (!handled && (bits & (AS_EVENT_WAKE_WORD_RUNNING | AS_EVENT_AUDIO_PROCESSOR_RUNNING))) {
+             int samples = 160; // 10ms
+             std::vector<int16_t> data;
++            const uint64_t capture_timestamp_ms = esp_timer_get_time() / 1000;
+             if (ReadAudioData(data, 16000, samples)) {
+                 if (bits & AS_EVENT_WAKE_WORD_RUNNING) {
+                     wake_word_->Feed(data);
+                 }
+                 if (bits & AS_EVENT_AUDIO_PROCESSOR_RUNNING) {
++                    const size_t mono_samples = data.size() / codec_->input_channels();
++                    {
++                        std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++                        capture_segments_.push_back({mono_samples, capture_timestamp_ms});
++                        runtime_state_.MarkCaptureMetadataPending();
++                    }
+                     audio_processor_->Feed(std::move(data));
+                 }
+-                continue;
++                handled = true;
+             }
+         }
+ 
++        lifecycle_.EndInputWork();
+         // Read timeout/error should not terminate the input task.
+-        vTaskDelay(pdMS_TO_TICKS(10));
++        if (!handled) {
++            vTaskDelay(pdMS_TO_TICKS(10));
++        }
+     }
+ 
+     ESP_LOGW(TAG, "Audio input task stopped");
++    lifecycle_.MarkWorkerExited(AudioWorker::Input);
++    xEventGroupSetBits(event_group_, AS_EVENT_INPUT_TASK_EXITED);
+ }
+ 
+ void AudioService::AudioOutputTask() {
+@@ -322,6 +710,8 @@ void AudioService::AudioOutputTask() {
+     }
+ 
+     ESP_LOGW(TAG, "Audio output task stopped");
++    lifecycle_.MarkWorkerExited(AudioWorker::Output);
++    xEventGroupSetBits(event_group_, AS_EVENT_OUTPUT_TASK_EXITED);
+ }
+ 
+ void AudioService::OpusCodecTask() {
+@@ -395,6 +785,7 @@ void AudioService::OpusCodecTask() {
+         if (!audio_encode_queue_.empty() && audio_send_queue_.size() < MAX_SEND_PACKETS_IN_QUEUE) {
+             auto task = std::move(audio_encode_queue_.front());
+             audio_encode_queue_.pop_front();
++            lifecycle_.TryBeginEncoderWork();
+             audio_queue_cv_.notify_all();
+             lock.unlock();
+ 
+@@ -402,7 +793,9 @@ void AudioService::OpusCodecTask() {
+             packet->frame_duration = OPUS_FRAME_DURATION_MS;
+             packet->sample_rate = 16000;
+             packet->timestamp = task->timestamp;
++            packet->capture_timestamp_ms = task->capture_timestamp_ms;
+ 
++            bool encode_succeeded = false;
+             if (opus_encoder_ != nullptr && task->pcm.size() == encoder_frame_size_) {
+                 std::vector<uint8_t> buf(encoder_outbuf_size_);
+                 esp_audio_enc_in_frame_t in = {
+@@ -415,7 +808,7 @@ void AudioService::OpusCodecTask() {
+                     .encoded_bytes = 0,
+                 };
+                 auto ret = esp_opus_enc_process(opus_encoder_, &in, &out);
+-                if (ret == ESP_AUDIO_ERR_OK) {
++                if (ret == ESP_AUDIO_ERR_OK && out.encoded_bytes > 0) {
+                     packet->payload.assign(buf.data(), buf.data() + out.encoded_bytes);
+ 
+                     if (task->type == kAudioTaskTypeEncodeToSendQueue) {
+@@ -431,6 +824,7 @@ void AudioService::OpusCodecTask() {
+                         audio_testing_queue_.push_back(std::move(packet));
+                     }
+                     debug_statistics_.encode_count++;
++                    encode_succeeded = true;
+                 } else {
+                     ESP_LOGE(TAG, "Failed to encode audio, error code: %d", ret);
+                 }
+@@ -438,11 +832,19 @@ void AudioService::OpusCodecTask() {
+                 ESP_LOGE(TAG, "Failed to encode audio: encoder not configured or invalid frame size (got %u, expected %u)",
+                          task->pcm.size(), encoder_frame_size_);
+             }
++            if (!encode_succeeded) {
++                std::lock_guard<std::mutex> failure_lock(audio_queue_mutex_);
++                runtime_state_.MarkEncodeFailed();
++            }
++            lifecycle_.EndEncoderWork();
+             lock.lock();
++            audio_queue_cv_.notify_all();
+         }
+     }
+ 
+     ESP_LOGW(TAG, "Opus codec task stopped");
++    lifecycle_.MarkWorkerExited(AudioWorker::Codec);
++    xEventGroupSetBits(event_group_, AS_EVENT_CODEC_TASK_EXITED);
+ }
+ 
+ void AudioService::SetDecodeSampleRate(int sample_rate, int frame_duration) {
+@@ -481,10 +883,15 @@ void AudioService::SetDecodeSampleRate(int sample_rate, int frame_duration) {
+     }
+ }
+ 
+-void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm) {
++void AudioService::PushTaskToEncodeQueue(
++    AudioTaskType type,
++    std::vector<int16_t>&& pcm,
++    uint64_t capture_timestamp_ms
++) {
+     auto task = std::make_unique<AudioTask>();
+     task->type = type;
+     task->pcm = std::move(pcm);
++    task->capture_timestamp_ms = capture_timestamp_ms;
+     /* Push the task to the encode queue */
+     std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+ 
+@@ -498,11 +905,40 @@ void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t
+         timestamp_queue_.pop_front();
+     }
+ 
+-    audio_queue_cv_.wait(lock, [this]() { return audio_encode_queue_.size() < MAX_ENCODE_TASKS_IN_QUEUE; });
++    audio_queue_cv_.wait(lock, [this]() {
++        return service_stopped_ || audio_encode_queue_.size() < MAX_ENCODE_TASKS_IN_QUEUE;
++    });
++    if (service_stopped_) {
++        return;
++    }
+     audio_encode_queue_.push_back(std::move(task));
+     audio_queue_cv_.notify_all();
+ }
+ 
++uint64_t AudioService::ConsumeCaptureTimestamp(size_t samples) {
++    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
++    if (capture_segments_.empty()) {
++        return 0;
++    }
++
++    const uint64_t first_timestamp_ms = capture_segments_.front().timestamp_ms;
++    size_t remaining = samples;
++    while (remaining > 0 && !capture_segments_.empty()) {
++        auto& segment = capture_segments_.front();
++        if (segment.samples > remaining) {
++            segment.samples -= remaining;
++            remaining = 0;
++        } else {
++            remaining -= segment.samples;
++            capture_segments_.pop_front();
++        }
++    }
++    if (capture_segments_.empty()) {
++        runtime_state_.ClearCaptureMetadata();
++    }
++    return first_timestamp_ms;
++}
++
+ bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait) {
+     std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+     if (audio_decode_queue_.size() >= MAX_DECODE_PACKETS_IN_QUEUE) {
+@@ -576,12 +1012,36 @@ void AudioService::EnableWakeWordDetection(bool enable) {
+     }
+ }
+ 
+-void AudioService::EnableVoiceProcessing(bool enable) {
++AudioServicePrepareResult AudioService::PrepareVoiceProcessing() {
++    if (!initialized_ || audio_processor_ == nullptr) {
++        return AudioServicePrepareResult::NotInitialized;
++    }
++    if (runtime_state_.ProcessorPrepared()) {
++        return AudioServicePrepareResult::AlreadyPrepared;
++    }
++    if (!audio_processor_->Initialize(codec_, OPUS_FRAME_DURATION_MS, models_list_)) {
++        ESP_LOGE(TAG, "Failed to initialize audio processor");
++        return AudioServicePrepareResult::ProcessorInitializeFailed;
++    }
++    runtime_state_.MarkProcessorPrepared();
++    return AudioServicePrepareResult::Prepared;
++}
++
++AudioServiceVoiceResult AudioService::EnableVoiceProcessing(bool enable) {
+     ESP_LOGD(TAG, "%s voice processing", enable ? "Enabling" : "Disabling");
++    if (!initialized_ || audio_processor_ == nullptr || service_stopped_) {
++        return AudioServiceVoiceResult::NotInitialized;
++    }
+     if (enable) {
+-        if (!audio_processor_initialized_) {
+-            audio_processor_->Initialize(codec_, OPUS_FRAME_DURATION_MS, models_list_);
+-            audio_processor_initialized_ = true;
++        if (audio_processor_->IsRunning()) {
++            return AudioServiceVoiceResult::AlreadyInState;
++        }
++        if (!runtime_state_.ProcessorPrepared()) {
++            const auto prepare_result = PrepareVoiceProcessing();
++            if (prepare_result != AudioServicePrepareResult::Prepared &&
++                prepare_result != AudioServicePrepareResult::AlreadyPrepared) {
++                return AudioServiceVoiceResult::ProcessorInitializeFailed;
++            }
+         }
+ 
+         /* We should make sure no audio is playing */
+@@ -597,9 +1057,16 @@ void AudioService::EnableVoiceProcessing(bool enable) {
+         }
+         audio_processor_->Start();
+         xEventGroupSetBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
++        return AudioServiceVoiceResult::Started;
+     } else {
+-        audio_processor_->Stop();
++        if (!audio_processor_->IsRunning()) {
++            return AudioServiceVoiceResult::AlreadyInState;
++        }
++        const auto stop_result = audio_processor_->Stop();
+         xEventGroupClearBits(event_group_, AS_EVENT_AUDIO_PROCESSOR_RUNNING);
++        return stop_result == AudioProcessorStopResult::IncompleteTail
++            ? AudioServiceVoiceResult::IncompleteProcessorTail
++            : AudioServiceVoiceResult::Stopped;
+     }
+ }
+ 
+@@ -618,9 +1085,12 @@ void AudioService::EnableAudioTesting(bool enable) {
+ 
+ void AudioService::EnableDeviceAec(bool enable) {
+     ESP_LOGI(TAG, "%s device AEC", enable ? "Enabling" : "Disabling");
+-    if (!audio_processor_initialized_) {
+-        audio_processor_->Initialize(codec_, OPUS_FRAME_DURATION_MS, models_list_);
+-        audio_processor_initialized_ = true;
++    if (!runtime_state_.ProcessorPrepared()) {
++        if (!audio_processor_->Initialize(codec_, OPUS_FRAME_DURATION_MS, models_list_)) {
++            ESP_LOGE(TAG, "Failed to initialize audio processor for device AEC");
++            return;
++        }
++        runtime_state_.MarkProcessorPrepared();
+     }
+ 
+     audio_processor_->EnableDeviceAec(enable);
+diff --git a/main/audio/audio_service.h b/main/audio/audio_service.h
+index 99db546..ded3b09 100644
+--- a/main/audio/audio_service.h
++++ b/main/audio/audio_service.h
+@@ -6,6 +6,7 @@
+ #include <condition_variable>
+ #include <chrono>
+ #include <mutex>
++#include <atomic>
+ 
+ #include <freertos/FreeRTOS.h>
+ #include <freertos/task.h>
+@@ -19,6 +20,8 @@
+ #include "esp_audio_types.h"
+ 
+ #include "audio_codec.h"
++#include "audio_lifecycle_state.h"
++#include "audio_runtime_state.h"
+ #include "audio_processor.h"
+ #include "processors/audio_debugger.h"
+ #include "wake_word.h"
+@@ -51,6 +54,9 @@
+ #define AS_EVENT_WAKE_WORD_RUNNING          (1 << 1)
+ #define AS_EVENT_AUDIO_PROCESSOR_RUNNING    (1 << 2)
+ #define AS_EVENT_PLAYBACK_NOT_EMPTY         (1 << 3)
++#define AS_EVENT_INPUT_TASK_EXITED           (1 << 4)
++#define AS_EVENT_OUTPUT_TASK_EXITED          (1 << 5)
++#define AS_EVENT_CODEC_TASK_EXITED           (1 << 6)
+ 
+ #define AS_OPUS_GET_FRAME_DRU_ENUM(duration_ms)                   \
+     ((duration_ms) == 5 ? ESP_OPUS_ENC_FRAME_DURATION_5_MS :      \
+@@ -92,7 +98,63 @@ enum AudioTaskType {
+ struct AudioTask {
+     AudioTaskType type;
+     std::vector<int16_t> pcm;
+-    uint32_t timestamp;
++    uint32_t timestamp = 0;
++    uint64_t capture_timestamp_ms = 0;
++};
++
++enum class AudioServiceInitResult {
++    Ok = 0,
++    InvalidCodec,
++    DecoderFailed,
++    EncoderFailed,
++    InputResamplerFailed,
++    ProcessorFailed,
++    TimerFailed,
++};
++
++enum class AudioServiceStopResult {
++    Complete = 0,
++    NotStarted,
++    IncompleteAudio,
++    EncodeFailed,
++    InputQuiesceTimeout,
++    DrainTimeout,
++    ProcessorJoinTimeout,
++    TaskJoinTimeout,
++};
++
++enum class AudioServiceStartResult {
++    Started = 0,
++    AlreadyStarted,
++    NotInitialized,
++    TaskCreationFailed,
++    RollbackJoinTimeout,
++    ShutdownFailureLatched,
++};
++
++enum class AudioServiceDrainResult {
++    Complete = 0,
++    NotStarted,
++    IncompleteProcessorTail,
++    EncoderFailed,
++    InputQuiesceTimeout,
++    EncoderDrainTimeout,
++};
++
++enum class AudioServicePrepareResult {
++    Prepared = 0,
++    AlreadyPrepared,
++    NotInitialized,
++    ProcessorInitializeFailed,
++};
++
++enum class AudioServiceVoiceResult {
++    Started = 0,
++    Stopped,
++    AlreadyInState,
++    NotInitialized,
++    ProcessorInitializeFailed,
++    IncompleteProcessorTail,
+ };
+ 
+ struct DebugStatistics {
+@@ -104,12 +166,17 @@ struct DebugStatistics {
+ 
+ class AudioService {
+ public:
+-    AudioService();
++    explicit AudioService(bool force_no_audio_processor = false);
+     ~AudioService();
+ 
+-    void Initialize(AudioCodec* codec);
+-    void Start();
+-    void Stop();
++    AudioServiceInitResult Initialize(AudioCodec* codec);
++    AudioServiceStartResult Start();
++    AudioServiceStopResult Stop(uint32_t timeout_ms = 3000);
++    AudioServiceStopResult StopAndDrain(uint32_t timeout_ms = 3000);
++    AudioServiceDrainResult BeginDrain(uint32_t timeout_ms = 3000);
++    AudioServiceStopResult FinishStop(uint32_t timeout_ms = 3000);
++    AudioServicePrepareResult PrepareVoiceProcessing();
++    bool CanDestroy() const;
+     void EncodeWakeWord();
+     std::unique_ptr<AudioStreamPacket> PopWakeWordPacket();
+     const std::string& GetLastWakeWord() const;
+@@ -121,7 +188,7 @@ public:
+     bool IsAfeWakeWord();
+ 
+     void EnableWakeWordDetection(bool enable);
+-    void EnableVoiceProcessing(bool enable);
++    AudioServiceVoiceResult EnableVoiceProcessing(bool enable);
+     void EnableAudioTesting(bool enable);
+     void EnableDeviceAec(bool enable);
+ 
+@@ -173,12 +240,22 @@ private:
+     std::deque<std::unique_ptr<AudioTask>> audio_playback_queue_;
+     // For server AEC
+     std::deque<uint32_t> timestamp_queue_;
++    struct CaptureSegment {
++        size_t samples;
++        uint64_t timestamp_ms;
++    };
++    std::deque<CaptureSegment> capture_segments_;
+ 
+     bool wake_word_initialized_ = false;
+-    bool audio_processor_initialized_ = false;
+     bool voice_detected_ = false;
+-    bool service_stopped_ = true;
++    std::atomic<bool> service_stopped_ = true;
++    bool initialized_ = false;
++    bool force_no_audio_processor_ = false;
+     bool audio_input_need_warmup_ = false;
++    bool drain_started_ = false;
++    bool shutdown_failure_latched_ = false;
++    AudioLifecycleState lifecycle_;
++    AudioRuntimeState runtime_state_;
+ 
+     esp_timer_handle_t audio_power_timer_ = nullptr;
+     std::chrono::steady_clock::time_point last_input_time_;
+@@ -187,9 +264,16 @@ private:
+     void AudioInputTask();
+     void AudioOutputTask();
+     void OpusCodecTask();
+-    void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
++    void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm, uint64_t capture_timestamp_ms = 0);
++    uint64_t ConsumeCaptureTimestamp(size_t samples);
++    AudioServiceStopResult StopInternal(bool drain, uint32_t timeout_ms);
++    bool WaitForInputQuiescence(int64_t deadline_us);
++    bool WaitForEncoderQuiescence(int64_t deadline_us);
++    AudioServiceStopResult JoinWorkersAndProcessor(int64_t deadline_us);
++    void RequestWorkersStop();
++    void RollbackInitialization();
+     void SetDecodeSampleRate(int sample_rate, int frame_duration);
+     void CheckAndUpdateAudioPowerState();
+ };
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/main/audio/audio_worker_startup_policy.h b/main/audio/audio_worker_startup_policy.h
+new file mode 100644
+index 0000000..8d7ddcb
+--- /dev/null
++++ b/main/audio/audio_worker_startup_policy.h
+@@ -0,0 +1,27 @@
++#ifndef AUDIO_WORKER_STARTUP_POLICY_H
++#define AUDIO_WORKER_STARTUP_POLICY_H
++
++enum class AudioWorkerStartupResult {
++    Started = 0,
++    CreationFailed,
++    RollbackFailed,
++};
++
++template <typename CreateInput, typename CreateOutput, typename CreateCodec, typename Rollback>
++AudioWorkerStartupResult StartAudioWorkers(
++    CreateInput create_input,
++    CreateOutput create_output,
++    CreateCodec create_codec,
++    Rollback rollback
++) {
++    const bool input_created = create_input();
++    const bool output_created = create_output();
++    const bool codec_created = create_codec();
++    if (input_created && output_created && codec_created) {
++        return AudioWorkerStartupResult::Started;
++    }
++    return rollback() ? AudioWorkerStartupResult::CreationFailed
++                      : AudioWorkerStartupResult::RollbackFailed;
++}
++
++#endif
+diff --git a/main/audio/pcm_frame_accumulator.h b/main/audio/pcm_frame_accumulator.h
+new file mode 100644
+index 0000000..2977acf
+--- /dev/null
++++ b/main/audio/pcm_frame_accumulator.h
+@@ -0,0 +1,58 @@
++#ifndef PCM_FRAME_ACCUMULATOR_H
++#define PCM_FRAME_ACCUMULATOR_H
++
++#include <cstddef>
++#include <cstdint>
++#include <utility>
++#include <vector>
++
++#include "pcm_tail_policy.h"
++
++class PcmFrameAccumulator {
++public:
++    explicit PcmFrameAccumulator(size_t frame_samples = 0)
++        : frame_samples_(frame_samples)
++    {
++        buffer_.reserve(frame_samples_);
++    }
++
++    void ResetFrameSize(size_t frame_samples)
++    {
++        frame_samples_ = frame_samples;
++        buffer_.clear();
++        buffer_.reserve(frame_samples_);
++    }
++
++    template <typename Emit>
++    void Append(std::vector<int16_t>&& samples, Emit&& emit)
++    {
++        buffer_.insert(buffer_.end(), samples.begin(), samples.end());
++        while (frame_samples_ > 0 && buffer_.size() >= frame_samples_) {
++            if (buffer_.size() == frame_samples_) {
++                emit(std::move(buffer_));
++                buffer_.clear();
++                buffer_.reserve(frame_samples_);
++            } else {
++                emit(std::vector<int16_t>(buffer_.begin(), buffer_.begin() + frame_samples_));
++                buffer_.erase(buffer_.begin(), buffer_.begin() + frame_samples_);
++            }
++        }
++    }
++
++    PcmTailResult Flush()
++    {
++        const auto result = ResolvePcmTail(buffer_.size());
++        buffer_.clear();
++        return result;
++    }
++
++    bool empty() const { return buffer_.empty(); }
++    size_t size() const { return buffer_.size(); }
++    size_t frame_size() const { return frame_samples_; }
++
++private:
++    size_t frame_samples_ = 0;
++    std::vector<int16_t> buffer_;
++};
++
++#endif
+diff --git a/main/audio/pcm_tail_policy.h b/main/audio/pcm_tail_policy.h
+new file mode 100644
+index 0000000..f77d298
+--- /dev/null
++++ b/main/audio/pcm_tail_policy.h
+@@ -0,0 +1,14 @@
++#ifndef PCM_TAIL_POLICY_H
++#define PCM_TAIL_POLICY_H
++
++enum class PcmTailResult {
++    Complete = 0,
++    Incomplete,
++};
++
++constexpr PcmTailResult ResolvePcmTail(unsigned long buffered_samples)
++{
++    return buffered_samples == 0 ? PcmTailResult::Complete : PcmTailResult::Incomplete;
++}
++
++#endif
+diff --git a/main/audio/processors/afe_audio_processor.cc b/main/audio/processors/afe_audio_processor.cc
+index 15e9cc5..d825643 100644
+--- a/main/audio/processors/afe_audio_processor.cc
++++ b/main/audio/processors/afe_audio_processor.cc
+@@ -2,6 +2,8 @@
+ #include <esp_log.h>
+ 
+ #define PROCESSOR_RUNNING 0x01
++#define PROCESSOR_SHUTDOWN 0x02
++#define PROCESSOR_TASK_EXITED 0x04
+ 
+ #define TAG "AfeAudioProcessor"
+ 
+@@ -10,7 +12,10 @@ AfeAudioProcessor::AfeAudioProcessor()
+     event_group_ = xEventGroupCreate();
+ }
+ 
+-void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srmodel_list_t* models_list) {
++bool AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srmodel_list_t* models_list) {
++    if (codec == nullptr || frame_duration_ms <= 0 || task_handle_ != nullptr) {
++        return false;
++    }
+     codec_ = codec;
+     frame_samples_ = frame_duration_ms * 16000 / 1000;
+ 
+@@ -33,11 +38,19 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
+     } else {
+         models = models_list;
+     }
++    if (models == nullptr) {
++        ESP_LOGE(TAG, "Failed to initialize speech models");
++        return false;
++    }
+ 
+     char* ns_model_name = esp_srmodel_filter(models, ESP_NSNET_PREFIX, NULL);
+     char* vad_model_name = esp_srmodel_filter(models, ESP_VADN_PREFIX, NULL);
+     
+     afe_config_t* afe_config = afe_config_init(input_format.c_str(), NULL, AFE_TYPE_VC, AFE_MODE_HIGH_PERF);
++    if (afe_config == nullptr) {
++        ESP_LOGE(TAG, "Failed to create AFE config");
++        return false;
++    }
+     afe_config->aec_mode = AEC_MODE_VOIP_HIGH_PERF;
+     afe_config->vad_mode = VAD_MODE_0;
+     afe_config->vad_min_noise_ms = 100;
+@@ -65,20 +78,41 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srm
+ #endif
+ 
+     afe_iface_ = esp_afe_handle_from_config(afe_config);
++    if (afe_iface_ == nullptr) {
++        ESP_LOGE(TAG, "Failed to create AFE interface");
++        return false;
++    }
+     afe_data_ = afe_iface_->create_from_config(afe_config);
+-    
+-    xTaskCreate([](void* arg) {
++    if (afe_data_ == nullptr) {
++        ESP_LOGE(TAG, "Failed to create AFE data");
++        return false;
++    }
++
++    xEventGroupClearBits(event_group_, PROCESSOR_RUNNING | PROCESSOR_SHUTDOWN |
++        PROCESSOR_TASK_EXITED);
++    BaseType_t task_result = xTaskCreate([](void* arg) {
+         auto this_ = (AfeAudioProcessor*)arg;
+         this_->AudioProcessorTask();
+         vTaskDelete(NULL);
+-    }, "audio_communication", 4096, this, 3, NULL);
++    }, "audio_communication", 4096, this, 3, &task_handle_);
++    if (task_result != pdPASS) {
++        task_handle_ = nullptr;
++        afe_iface_->destroy(afe_data_);
++        afe_data_ = nullptr;
++        ESP_LOGE(TAG, "Failed to create AFE task");
++        return false;
++    }
++    return true;
+ }
+ 
+ AfeAudioProcessor::~AfeAudioProcessor() {
+-    if (afe_data_ != nullptr) {
+-        afe_iface_->destroy(afe_data_);
++    while (Shutdown(1000) == AudioProcessorShutdownResult::TaskJoinTimeout) {
++        ESP_LOGE(TAG, "AFE task still live during destruction; retaining resources and waiting");
++    }
++    if (event_group_ != nullptr) {
++        vEventGroupDelete(event_group_);
++        event_group_ = nullptr;
+     }
+-    vEventGroupDelete(event_group_);
+ }
+ 
+ size_t AfeAudioProcessor::GetFeedSize() {
+@@ -107,17 +141,54 @@ void AfeAudioProcessor::Feed(std::vector<int16_t>&& data) {
+ }
+ 
+ void AfeAudioProcessor::Start() {
++    xEventGroupClearBits(event_group_, PROCESSOR_SHUTDOWN | PROCESSOR_TASK_EXITED);
+     xEventGroupSetBits(event_group_, PROCESSOR_RUNNING);
+ }
+ 
+-void AfeAudioProcessor::Stop() {
++AudioProcessorStopResult AfeAudioProcessor::Stop() {
+     xEventGroupClearBits(event_group_, PROCESSOR_RUNNING);
+ 
+-    std::lock_guard<std::mutex> lock(input_buffer_mutex_);
++    std::scoped_lock lock(input_buffer_mutex_, output_buffer_mutex_);
++    const bool incomplete_tail = !input_buffer_.empty() || !output_buffer_.empty();
+     if (afe_data_ != nullptr) {
+         afe_iface_->reset_buffer(afe_data_);
+     }
+     input_buffer_.clear();
++    output_buffer_.clear();
++    return incomplete_tail ? AudioProcessorStopResult::IncompleteTail
++                           : AudioProcessorStopResult::Complete;
++}
++
++AudioProcessorShutdownResult AfeAudioProcessor::Shutdown(uint32_t timeout_ms) {
++    Stop();
++    if (task_handle_ != nullptr) {
++        xEventGroupSetBits(event_group_, PROCESSOR_SHUTDOWN | PROCESSOR_RUNNING);
++        if (afe_data_ != nullptr) {
++            afe_iface_->reset_buffer(afe_data_);
++        }
++        const EventBits_t exited = xEventGroupWaitBits(
++            event_group_, PROCESSOR_TASK_EXITED, pdFALSE, pdTRUE, pdMS_TO_TICKS(timeout_ms)
++        );
++        if ((exited & PROCESSOR_TASK_EXITED) == 0) {
++            return AudioProcessorShutdownResult::TaskJoinTimeout;
++        }
++        task_handle_ = nullptr;
++    }
++    if (afe_data_ != nullptr) {
++        afe_iface_->destroy(afe_data_);
++        afe_data_ = nullptr;
++    }
++    afe_iface_ = nullptr;
++    return AudioProcessorShutdownResult::Complete;
++}
++
++bool AfeAudioProcessor::CanDestroy() const {
++    return task_handle_ == nullptr && IsOutputQuiescent();
++}
++
++bool AfeAudioProcessor::IsOutputQuiescent() const {
++    std::lock_guard<std::mutex> lock(output_dispatch_mutex_);
++    return output_dispatch_.IsQuiescent();
+ }
+ 
+ bool AfeAudioProcessor::IsRunning() {
+@@ -139,9 +210,17 @@ void AfeAudioProcessor::AudioProcessorTask() {
+         feed_size, fetch_size);
+ 
+     while (true) {
+-        xEventGroupWaitBits(event_group_, PROCESSOR_RUNNING, pdFALSE, pdTRUE, portMAX_DELAY);
++        const EventBits_t bits = xEventGroupWaitBits(
++            event_group_, PROCESSOR_RUNNING | PROCESSOR_SHUTDOWN, pdFALSE, pdFALSE, portMAX_DELAY
++        );
++        if (bits & PROCESSOR_SHUTDOWN) {
++            break;
++        }
+ 
+         auto res = afe_iface_->fetch_with_delay(afe_data_, portMAX_DELAY);
++        if (xEventGroupGetBits(event_group_) & PROCESSOR_SHUTDOWN) {
++            break;
++        }
+         if ((xEventGroupGetBits(event_group_) & PROCESSOR_RUNNING) == 0) {
+             continue;
+         }
+@@ -164,26 +243,62 @@ void AfeAudioProcessor::AudioProcessorTask() {
+         }
+ 
+         if (output_callback_) {
+-            size_t samples = res->data_size / sizeof(int16_t);
+-            
+-            // Add data to buffer
+-            output_buffer_.insert(output_buffer_.end(), res->data, res->data + samples);
+-            
+-            // Output complete frames when buffer has enough data
+-            while (output_buffer_.size() >= frame_samples_) {
+-                if (output_buffer_.size() == frame_samples_) {
+-                    // If buffer size equals frame size, move the entire buffer
+-                    output_callback_(std::move(output_buffer_));
+-                    output_buffer_.clear();
+-                    output_buffer_.reserve(frame_samples_);
+-                } else {
+-                    // If buffer size exceeds frame size, copy one frame and remove it
+-                    output_callback_(std::vector<int16_t>(output_buffer_.begin(), output_buffer_.begin() + frame_samples_));
+-                    output_buffer_.erase(output_buffer_.begin(), output_buffer_.begin() + frame_samples_);
++            std::vector<std::vector<int16_t>> ready_frames;
++            {
++                std::lock_guard<std::mutex> output_lock(output_buffer_mutex_);
++                // Stop() clears PROCESSOR_RUNNING before taking this mutex. Recheck
++                // here so an iteration that passed the earlier check cannot detach
++                // output after Stop() has synchronized with this critical section.
++                if (IsRunning()) {
++                    size_t samples = res->data_size / sizeof(int16_t);
++
++                    // Register all detached frames before releasing the buffer lock.
++                    // Stop() can therefore only return before this batch is admitted,
++                    // or after the drain barrier can observe the entire batch.
++                    output_buffer_.insert(output_buffer_.end(), res->data, res->data + samples);
++                    while (output_buffer_.size() >= frame_samples_) {
++                        if (output_buffer_.size() == frame_samples_) {
++                            ready_frames.push_back(std::move(output_buffer_));
++                            output_buffer_.clear();
++                            output_buffer_.reserve(frame_samples_);
++                        } else {
++                            ready_frames.emplace_back(
++                                output_buffer_.begin(), output_buffer_.begin() + frame_samples_
++                            );
++                            output_buffer_.erase(
++                                output_buffer_.begin(), output_buffer_.begin() + frame_samples_
++                            );
++                        }
++                    }
++                    if (!ready_frames.empty()) {
++                        std::lock_guard<std::mutex> dispatch_lock(output_dispatch_mutex_);
++                        output_dispatch_.DetachFrames(
++                            static_cast<unsigned>(ready_frames.size())
++                        );
++                    }
++                }
++            }
++            // The AudioService callback may block on encode-queue backpressure. Never
++            // invoke it while holding output_buffer_mutex_: Stop() must remain able to
++            // clear processor state and reach the bounded cooperative join.
++            for (auto& frame : ready_frames) {
++                {
++                    std::lock_guard<std::mutex> dispatch_lock(output_dispatch_mutex_);
++                    if (!output_dispatch_.BeginCallback()) {
++                        continue;
++                    }
++                }
++                output_callback_(std::move(frame));
++                {
++                    std::lock_guard<std::mutex> dispatch_lock(output_dispatch_mutex_);
++                    output_dispatch_.EndCallback();
+                 }
+             }
+         }
+     }
++
++    ESP_LOGI(TAG, "AFE task stopped");
++    xEventGroupSetBits(event_group_, PROCESSOR_TASK_EXITED);
+ }
+ 
+ void AfeAudioProcessor::EnableDeviceAec(bool enable) {
+diff --git a/main/audio/processors/afe_audio_processor.h b/main/audio/processors/afe_audio_processor.h
+index fe2f025..ce089f6 100644
+--- a/main/audio/processors/afe_audio_processor.h
++++ b/main/audio/processors/afe_audio_processor.h
+@@ -13,16 +13,20 @@
+ 
+ #include "audio_processor.h"
+ #include "audio_codec.h"
++#include "audio_output_dispatch_policy.h"
+ 
+ class AfeAudioProcessor : public AudioProcessor {
+ public:
+     AfeAudioProcessor();
+     ~AfeAudioProcessor();
+ 
+-    void Initialize(AudioCodec* codec, int frame_duration_ms, srmodel_list_t* models_list) override;
++    bool Initialize(AudioCodec* codec, int frame_duration_ms, srmodel_list_t* models_list) override;
+     void Feed(std::vector<int16_t>&& data) override;
+     void Start() override;
+-    void Stop() override;
++    AudioProcessorStopResult Stop() override;
++    AudioProcessorShutdownResult Shutdown(uint32_t timeout_ms) override;
++    bool CanDestroy() const override;
++    bool IsOutputQuiescent() const override;
+     bool IsRunning() override;
+     void OnOutput(std::function<void(std::vector<int16_t>&& data)> callback) override;
+     void OnVadStateChange(std::function<void(bool speaking)> callback) override;
+@@ -41,8 +45,12 @@ private:
+     std::vector<int16_t> input_buffer_;
+     std::mutex input_buffer_mutex_;
+     std::vector<int16_t> output_buffer_;
++    mutable std::mutex output_buffer_mutex_;
++    AudioOutputDispatchPolicy output_dispatch_;
++    mutable std::mutex output_dispatch_mutex_;
++    TaskHandle_t task_handle_ = nullptr;
+ 
+     void AudioProcessorTask();
+ };
+ 
+-#endif 
+\ No newline at end of file
++#endif
+diff --git a/main/audio/processors/no_audio_processor.cc b/main/audio/processors/no_audio_processor.cc
+index 90f997a..4b96262 100644
+--- a/main/audio/processors/no_audio_processor.cc
++++ b/main/audio/processors/no_audio_processor.cc
+@@ -3,10 +3,14 @@
+ 
+ #define TAG "NoAudioProcessor"
+ 
+-void NoAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srmodel_list_t* models_list) {
++bool NoAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms, srmodel_list_t* models_list) {
++    if (codec == nullptr || frame_duration_ms <= 0) {
++        return false;
++    }
+     codec_ = codec;
+-    frame_samples_ = frame_duration_ms * 16000 / 1000;
+-    output_buffer_.reserve(frame_samples_);
++    std::lock_guard<std::mutex> lock(mutex_);
++    output_frames_.ResetFrameSize(frame_duration_ms * 16000 / 1000);
++    return true;
+ }
+ 
+ void NoAudioProcessor::Feed(std::vector<int16_t>&& data) {
+@@ -14,35 +18,52 @@ void NoAudioProcessor::Feed(std::vector<int16_t>&& data) {
+         return;
+     }
+ 
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!is_running_) {
++        return;
++    }
++
+     // Convert stereo to mono if needed
+     if (codec_->input_channels() == 2) {
++        std::vector<int16_t> mono;
++        mono.reserve(data.size() / 2);
+         for (size_t i = 0, j = 0; i < data.size() / 2; ++i, j += 2) {
+-            output_buffer_.push_back(data[j]);
++            mono.push_back(data[j]);
+         }
+-    } else {
+-        output_buffer_.insert(output_buffer_.end(), data.begin(), data.end());
++        data = std::move(mono);
+     }
+ 
+-    // Output complete frames when buffer has enough data
+-    while (output_buffer_.size() >= (size_t)frame_samples_) {
+-        if (output_buffer_.size() == (size_t)frame_samples_) {
+-            output_callback_(std::move(output_buffer_));
+-            output_buffer_.clear();
+-            output_buffer_.reserve(frame_samples_);
+-        } else {
+-            output_callback_(std::vector<int16_t>(output_buffer_.begin(), output_buffer_.begin() + frame_samples_));
+-            output_buffer_.erase(output_buffer_.begin(), output_buffer_.begin() + frame_samples_);
+-        }
+-    }
++    output_frames_.Append(std::move(data), [this](std::vector<int16_t>&& frame) {
++        output_callback_(std::move(frame));
++    });
+ }
+ 
+ void NoAudioProcessor::Start() {
+     is_running_ = true;
+ }
+ 
+-void NoAudioProcessor::Stop() {
++AudioProcessorStopResult NoAudioProcessor::Stop() {
+     is_running_ = false;
+-    output_buffer_.clear();
++    std::lock_guard<std::mutex> lock(mutex_);
++    return output_frames_.Flush() == PcmTailResult::Complete
++        ? AudioProcessorStopResult::Complete
++        : AudioProcessorStopResult::IncompleteTail;
++}
++
++AudioProcessorShutdownResult NoAudioProcessor::Shutdown(uint32_t timeout_ms) {
++    (void)timeout_ms;
++    Stop();
++    return AudioProcessorShutdownResult::Complete;
++}
++
++bool NoAudioProcessor::CanDestroy() const {
++    return true;
++}
++
++bool NoAudioProcessor::IsOutputQuiescent() const {
++    // Feed() dispatches synchronously on AudioInputTask, whose in-flight bit is
++    // already part of AudioLifecycleState::ProducersQuiescent().
++    return true;
+ }
+ 
+ bool NoAudioProcessor::IsRunning() {
+@@ -61,7 +82,8 @@ size_t NoAudioProcessor::GetFeedSize() {
+     if (!codec_) {
+         return 0;
+     }
+-    return frame_samples_;
++    std::lock_guard<std::mutex> lock(mutex_);
++    return output_frames_.frame_size();
+ }
+ 
+ void NoAudioProcessor::EnableDeviceAec(bool enable) {
+diff --git a/main/audio/processors/no_audio_processor.h b/main/audio/processors/no_audio_processor.h
+index 70ef1d1..96f54fd 100644
+--- a/main/audio/processors/no_audio_processor.h
++++ b/main/audio/processors/no_audio_processor.h
+@@ -4,19 +4,24 @@
+ #include <vector>
+ #include <functional>
+ #include <atomic>
++#include <mutex>
+ 
+ #include "audio_processor.h"
+ #include "audio_codec.h"
++#include "pcm_frame_accumulator.h"
+ 
+ class NoAudioProcessor : public AudioProcessor {
+ public:
+     NoAudioProcessor() = default;
+     ~NoAudioProcessor() = default;
+ 
+-    void Initialize(AudioCodec* codec, int frame_duration_ms, srmodel_list_t* models_list) override;
++    bool Initialize(AudioCodec* codec, int frame_duration_ms, srmodel_list_t* models_list) override;
+     void Feed(std::vector<int16_t>&& data) override;
+     void Start() override;
+-    void Stop() override;
++    AudioProcessorStopResult Stop() override;
++    AudioProcessorShutdownResult Shutdown(uint32_t timeout_ms) override;
++    bool CanDestroy() const override;
++    bool IsOutputQuiescent() const override;
+     bool IsRunning() override;
+     void OnOutput(std::function<void(std::vector<int16_t>&& data)> callback) override;
+     void OnVadStateChange(std::function<void(bool speaking)> callback) override;
+@@ -25,11 +30,11 @@ public:
+ 
+ private:
+     AudioCodec* codec_ = nullptr;
+-    int frame_samples_ = 0;
+-    std::vector<int16_t> output_buffer_;
++    mutable std::mutex mutex_;
++    PcmFrameAccumulator output_frames_;
+     std::function<void(std::vector<int16_t>&& data)> output_callback_;
+     std::function<void(bool speaking)> vad_state_change_callback_;
+     std::atomic<bool> is_running_ = false;
+ };
+ 
+-#endif 
+\ No newline at end of file
++#endif
 diff --git a/main/boards/common/i2c_device.cc b/main/boards/common/i2c_device.cc
 index 835997d..ea50d51 100644
 --- a/main/boards/common/i2c_device.cc
@@ -271,3 +2307,15 @@ index 7bc917b..874b137 100644
  };
  
  #endif // I2C_DEVICE_H
+diff --git a/main/protocols/protocol.h b/main/protocols/protocol.h
+index 28ef604..31398c3 100644
+--- a/main/protocols/protocol.h
++++ b/main/protocols/protocol.h
+@@ -11,6 +11,7 @@ struct AudioStreamPacket {
+     int sample_rate = 0;
+     int frame_duration = 0;
+     uint32_t timestamp = 0;
++    uint64_t capture_timestamp_ms = 0;
+     std::vector<uint8_t> payload;
+ };
+ 
