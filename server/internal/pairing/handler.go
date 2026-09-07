@@ -62,7 +62,7 @@ func (h HTTPHandlers) guard(r *ghttp.Request) bool {
 func (h HTTPHandlers) write(r *ghttp.Request, status int, value any) {
 	r.Response.WriteHeader(status)
 	r.Response.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(r.Response.Writer).Encode(value)
+	r.Response.WriteJson(value)
 }
 
 func decodeRequest(r *ghttp.Request, target any) error {

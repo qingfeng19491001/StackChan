@@ -72,7 +72,16 @@ var (
 					Audience: audience,
 					JWKSURL:  jwksURL,
 				}
-				authenticateUser = jwtAuthenticator.Authenticate
+				// Keep the explicit local-dev credential usable for the local demo
+				// even when the same binary also has production JWT settings.
+				// All other requests are verified against Supabase JWKS.
+				jwtAuthenticate := jwtAuthenticator.Authenticate
+				authenticateUser = func(r *ghttp.Request) (string, error) {
+					if userID, localErr := pairing.LocalUserAuthenticator(r); localErr == nil {
+						return userID, nil
+					}
+					return jwtAuthenticate(r)
+				}
 			}
 			pairingHandlers := pairing.HTTPHandlers{
 				Repository:         pairing.DefaultRepository,

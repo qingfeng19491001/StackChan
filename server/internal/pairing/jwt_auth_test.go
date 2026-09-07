@@ -1,6 +1,8 @@
 package pairing
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
@@ -33,5 +35,29 @@ func TestJWTAuthenticatorVerifiesJWKSClaims(t *testing.T) {
 	}
 	if _, err := auth.AuthenticateHeader("Bearer " + signed + "broken"); err == nil {
 		t.Fatal("invalid signature accepted")
+	}
+}
+
+func TestJWTAuthenticatorVerifiesES256JWKSClaims(t *testing.T) {
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kid := "ec-key-1"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{{"kty": "EC", "kid": kid, "alg": "ES256", "use": "sig", "crv": "P-256", "x": base64.RawURLEncoding.EncodeToString(privateKey.PublicKey.X.Bytes()), "y": base64.RawURLEncoding.EncodeToString(privateKey.PublicKey.Y.Bytes())}}})
+	}))
+	defer server.Close()
+	now := time.Unix(1_700_000_000, 0)
+	auth := &JWTAuthenticator{Issuer: "https://project.supabase.co/auth/v1", Audience: "authenticated", JWKSURL: server.URL, Now: func() time.Time { return now }}
+	claims := jwt.RegisteredClaims{Subject: "user-es256", Issuer: auth.Issuer, Audience: jwt.ClaimStrings{auth.Audience}, ExpiresAt: jwt.NewNumericDate(now.Add(time.Minute)), IssuedAt: jwt.NewNumericDate(now)}
+	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+	token.Header["kid"] = kid
+	signed, err := token.SignedString(privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user, err := auth.AuthenticateHeader("Bearer " + signed); err != nil || user != "user-es256" {
+		t.Fatalf("user=%q err=%v", user, err)
 	}
 }
