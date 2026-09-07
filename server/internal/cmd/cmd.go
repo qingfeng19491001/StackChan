@@ -8,6 +8,7 @@ package cmd
 import (
 	"context"
 	"net/http"
+	"os"
 	"path/filepath"
 	"stackChan/internal/boot"
 	"stackChan/internal/controller/admin"
@@ -21,7 +22,9 @@ import (
 	"stackChan/internal/controller/stackchandevice"
 	"stackChan/internal/controller/user"
 	"stackChan/internal/controller/xiaozhi"
+	"stackChan/internal/meetingmetrics"
 	"stackChan/internal/middleware"
+	"stackChan/internal/pairing"
 	"stackChan/internal/web_socket"
 
 	"github.com/gogf/gf/v2/frame/g"
@@ -36,12 +39,61 @@ var (
 		Usage: "main",
 		Brief: "start http server",
 		Func: func(ctx context.Context, parser *gcmd.Parser) (err error) {
+			closeMeetingCluster, err := web_socket.ConfigureMeetingCluster(ctx)
+			if err != nil {
+				return err
+			}
+			defer closeMeetingCluster()
+			closePairingRepository, err := pairing.ConfigureDefaultRepository(ctx)
+			if err != nil {
+				return err
+			}
+			defer closePairingRepository()
+			closeMeetingStore, err := configureMeetingSessionStore(ctx)
+			if err != nil {
+				return err
+			}
+			defer closeMeetingStore()
+
 			s := g.Server()
 			s.SetClientMaxBodySize(100 * 1024 * 1024)
 
 			s.Use(middleware.CORS)
 
 			s.BindHandler("/stackChan/ws", web_socket.Handler)
+			authenticateUser := pairing.UserAuthenticator(pairing.LocalUserAuthenticator)
+			if jwksURL := os.Getenv("SUPABASE_JWKS_URL"); jwksURL != "" {
+				audience := os.Getenv("SUPABASE_JWT_AUDIENCE")
+				if audience == "" {
+					audience = "authenticated"
+				}
+				jwtAuthenticator := &pairing.JWTAuthenticator{
+					Issuer:   os.Getenv("SUPABASE_JWT_ISSUER"),
+					Audience: audience,
+					JWKSURL:  jwksURL,
+				}
+				authenticateUser = jwtAuthenticator.Authenticate
+			}
+			pairingHandlers := pairing.HTTPHandlers{
+				Repository:         pairing.DefaultRepository,
+				AuthenticateDevice: web_socket.GetMac,
+				AuthenticateUser:   authenticateUser,
+				DeviceGeneration:   web_socket.DeviceConnectionGeneration,
+				RequestPolicy:      web_socket.MeetingRequestPolicy(),
+				RateLimiter:        web_socket.NewPairingRateLimiter(),
+			}
+			s.BindHandler("POST:/stackChan/pairing-nonce", pairingHandlers.PairingNonce)
+			s.BindHandler("POST:/stackChan/bind", pairingHandlers.Bind)
+			s.BindHandler("GET:/stackChan/devices", pairingHandlers.Devices)
+			s.BindHandler("POST:/stackChan/unbind", pairingHandlers.Unbind)
+			s.BindHandler("DELETE:/stackChan/bind/:mac", pairingHandlers.UnbindPath)
+			s.BindHandler("POST:/stackChan/ws-ticket", pairingHandlers.WSTicket)
+			if metricsToken := os.Getenv("STACKCHAN_METRICS_TOKEN"); metricsToken != "" {
+				metricsHandler := meetingmetrics.AuthorizedHandler(meetingmetrics.Default, metricsToken)
+				s.BindHandler("GET:/stackChan/metrics", func(r *ghttp.Request) {
+					metricsHandler.ServeHTTP(r.Response.Writer, r.Request)
+				})
+			}
 
 			// heartBeat
 			boot.InitCron()
@@ -80,8 +132,11 @@ var (
 				group.Bind(admin.NewV1(), file.NewV1())
 			})
 
-			// Do not use SetServerRoot, globally only provide frontend entry via /web
-			s.SetServerRoot("web/management")
+			// The open-source server checkout does not always include the optional
+			// management frontend. API/WebSocket startup must not fail without it.
+			if gfile.Exists("web/management") {
+				s.SetServerRoot("web/management")
+			}
 
 			s.SetPort(12800)
 			s.Run()

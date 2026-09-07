@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: template-single
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: main
+          env:
+            # These non-secret controls must be set for the real public host.
+            # Do not put a ticket/device credential into a ConfigMap.
+            - name: STACKCHAN_REQUIRE_TLS
+              value: "true"
+            # A detached Auro socket may reattach once within five seconds.
+            - name: STACKCHAN_MEETING_ENABLE_REATTACH
+              value: "true"
+            - name: STACKCHAN_ALLOWED_HOSTS
+              valueFrom:
+                configMapKeyRef:
+                  name: stackchan-meeting-runtime
+                  key: allowedHosts
+            - name: STACKCHAN_ALLOWED_ORIGINS
+              valueFrom:
+                configMapKeyRef:
+                  name: stackchan-meeting-runtime
+                  key: allowedOrigins
+            - name: STACKCHAN_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # A shared Redis is mandatory with replicas > 1: it backs pairing,
+            # ticket consumption, session claims and inter-node WS delivery.
+            - name: STACKCHAN_REDIS_ADDR
+              valueFrom:
+                secretKeyRef:
+                  name: stackchan-meeting-secrets
+                  key: redisAddress
+            - name: STACKCHAN_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: stackchan-meeting-secrets
+                  key: redisPassword
+            - name: STACKCHAN_DEVICE_CREDENTIALS
+              valueFrom:
+                secretKeyRef:
+                  name: stackchan-meeting-secrets
+                  key: deviceCredentials
+            - name: STACKCHAN_DEVICE_CREDENTIALS_PREVIOUS
+              valueFrom:
+                secretKeyRef:
+                  name: stackchan-meeting-secrets
+                  key: previousDeviceCredentials
+                  optional: true
+            - name: STACKCHAN_DEVICE_CREDENTIALS_PREVIOUS_UNTIL
+              valueFrom:
+                configMapKeyRef:
+                  name: stackchan-meeting-runtime
+                  key: previousCredentialsUntil
+                  optional: true
