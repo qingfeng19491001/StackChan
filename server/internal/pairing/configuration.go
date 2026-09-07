@@ -15,6 +15,12 @@ import (
 // configured. With no Redis address the local development behavior remains
 // intentionally in-memory.
 func ConfigureDefaultRepository(ctx context.Context) (func(), error) {
+	if path := strings.TrimSpace(os.Getenv("STACKCHAN_SQLITE_PATH")); path != "" {
+		repository, err := NewSQLiteRepository(path, time.Now)
+		if err != nil { return nil, fmt.Errorf("open pairing SQLite: %w", err) }
+		DefaultRepository = repository
+		return func() { _ = repository.Close() }, nil
+	}
 	address := strings.TrimSpace(os.Getenv("STACKCHAN_REDIS_ADDR"))
 	if address == "" {
 		DefaultRepository = NewMemoryRepository(time.Now)

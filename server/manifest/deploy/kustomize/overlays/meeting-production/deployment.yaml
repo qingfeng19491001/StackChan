@@ -13,6 +13,14 @@ spec:
             # Do not put a ticket/device credential into a ConfigMap.
             - name: STACKCHAN_REQUIRE_TLS
               value: "true"
+            # Verify the access token sent by Auro and use its Supabase user
+            # id to isolate bound devices between users. JWKS is public.
+            - name: SUPABASE_JWKS_URL
+              value: "https://drtohtbfekirwojurtgy.supabase.co/auth/v1/.well-known/jwks.json"
+            - name: SUPABASE_JWT_ISSUER
+              value: "https://drtohtbfekirwojurtgy.supabase.co/auth/v1"
+            - name: SUPABASE_JWT_AUDIENCE
+              value: "authenticated"
             # A detached Auro socket may reattach once within five seconds.
             - name: STACKCHAN_MEETING_ENABLE_REATTACH
               value: "true"

@@ -1,6 +1,9 @@
 package pairing
 
 import (
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
@@ -21,12 +24,12 @@ type JWTAuthenticator struct {
 	HTTPClient                *http.Client
 	Now                       func() time.Time
 	mu                        sync.Mutex
-	keys                      map[string]*rsa.PublicKey
+	keys                      map[string]crypto.PublicKey
 	keysUntil                 time.Time
 }
 
 type jwkSet struct {
-	Keys []struct{ Kty, Kid, Use, Alg, N, E string } `json:"keys"`
+	Keys []struct{ Kty, Kid, Use, Alg, N, E, Crv, X, Y string } `json:"keys"`
 }
 
 func (a *JWTAuthenticator) Authenticate(r *ghttp.Request) (string, error) {
@@ -40,7 +43,7 @@ func (a *JWTAuthenticator) AuthenticateHeader(header string) (string, error) {
 	tokenText := strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
 	claims := &jwt.RegisteredClaims{}
 	keyFunc := func(token *jwt.Token) (any, error) {
-		if token.Method.Alg() != jwt.SigningMethodRS256.Alg() {
+		if token.Method.Alg() != jwt.SigningMethodRS256.Alg() && token.Method.Alg() != jwt.SigningMethodES256.Alg() {
 			return nil, ErrUnauthorizedJWT
 		}
 		kid, _ := token.Header["kid"].(string)
@@ -53,7 +56,7 @@ func (a *JWTAuthenticator) AuthenticateHeader(header string) (string, error) {
 	if now == nil {
 		now = time.Now
 	}
-	parsed, err := jwt.ParseWithClaims(tokenText, claims, keyFunc, jwt.WithIssuer(a.Issuer), jwt.WithAudience(a.Audience), jwt.WithExpirationRequired(), jwt.WithTimeFunc(now), jwt.WithValidMethods([]string{jwt.SigningMethodRS256.Alg()}))
+	parsed, err := jwt.ParseWithClaims(tokenText, claims, keyFunc, jwt.WithIssuer(a.Issuer), jwt.WithAudience(a.Audience), jwt.WithExpirationRequired(), jwt.WithTimeFunc(now), jwt.WithValidMethods([]string{jwt.SigningMethodRS256.Alg(), jwt.SigningMethodES256.Alg()}))
 	if err != nil || !parsed.Valid || claims.Subject == "" {
 		return "", ErrUnauthorizedJWT
 	}
@@ -62,7 +65,7 @@ func (a *JWTAuthenticator) AuthenticateHeader(header string) (string, error) {
 
 var ErrUnauthorizedJWT = errors.New("UNAUTHORIZED")
 
-func (a *JWTAuthenticator) key(kid string) (*rsa.PublicKey, error) {
+func (a *JWTAuthenticator) key(kid string) (crypto.PublicKey, error) {
 	now := time.Now()
 	if a.Now != nil {
 		now = a.Now()
@@ -99,25 +102,37 @@ func (a *JWTAuthenticator) refreshLocked(now time.Time) error {
 	if err := json.NewDecoder(io.LimitReader(response.Body, 1024*1024)).Decode(&set); err != nil {
 		return err
 	}
-	keys := make(map[string]*rsa.PublicKey)
+	keys := make(map[string]crypto.PublicKey)
 	for _, item := range set.Keys {
-		if item.Kty != "RSA" || item.Kid == "" || (item.Alg != "" && item.Alg != "RS256") {
+		if item.Kid == "" {
 			continue
 		}
-		n, err := base64.RawURLEncoding.DecodeString(item.N)
-		if err != nil {
+		if item.Kty == "RSA" && (item.Alg == "" || item.Alg == "RS256") {
+			n, nErr := base64.RawURLEncoding.DecodeString(item.N)
+			eBytes, eErr := base64.RawURLEncoding.DecodeString(item.E)
+			if nErr != nil || eErr != nil {
+				continue
+			}
+			e := 0
+			for _, value := range eBytes {
+				e = e<<8 + int(value)
+			}
+			if e > 0 {
+				keys[item.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(n), E: e}
+			}
 			continue
 		}
-		eBytes, err := base64.RawURLEncoding.DecodeString(item.E)
-		if err != nil {
-			continue
-		}
-		e := 0
-		for _, value := range eBytes {
-			e = e<<8 + int(value)
-		}
-		if e > 0 {
-			keys[item.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(n), E: e}
+		if item.Kty == "EC" && item.Crv == "P-256" && (item.Alg == "" || item.Alg == "ES256") {
+			x, xErr := base64.RawURLEncoding.DecodeString(item.X)
+			y, yErr := base64.RawURLEncoding.DecodeString(item.Y)
+			if xErr != nil || yErr != nil {
+				continue
+			}
+			curve := elliptic.P256()
+			publicKey := &ecdsa.PublicKey{Curve: curve, X: new(big.Int).SetBytes(x), Y: new(big.Int).SetBytes(y)}
+			if curve.IsOnCurve(publicKey.X, publicKey.Y) {
+				keys[item.Kid] = publicKey
+			}
 		}
 	}
 	if len(keys) == 0 {

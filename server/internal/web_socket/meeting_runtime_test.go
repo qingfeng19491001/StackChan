@@ -17,6 +17,21 @@ import (
 	wsprotocol "stackChan/internal/web_socket/protocol"
 )
 
+func TestStartCommandMatchesFirmwareAudioSchema(t *testing.T) {
+	frame := controlPayload(meeting.ControlMessage{Action: "meeting.start", SessionID: uuid.NewString(), CommandID: uuid.NewString()})
+	var body map[string]any
+	if err := json.Unmarshal((*frame)[5:], &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body) != 6 {
+		t.Fatalf("firmware requires 6 start fields: %#v", body)
+	}
+	audio := body["audio"].(map[string]any)
+	if len(audio) != 4 || audio["codec"] != "opus" || audio["sampleRate"] != float64(16000) || audio["channels"] != float64(1) || audio["frameDurationMs"] != float64(60) {
+		t.Fatalf("audio does not match firmware's exact four-field schema: %#v", audio)
+	}
+}
+
 func TestDeviceRequestedMeetingStartsOnlyAfterBoundAuroAccepts(t *testing.T) {
 	deviceServer, devicePeer := websocketPair(t)
 	defer devicePeer.Close()
@@ -202,7 +217,7 @@ func TestMeetingStartSentToDeviceIncludesFixedAudioContract(t *testing.T) {
 	}
 	expected := map[string]any{
 		"codec": "opus", "sampleRate": float64(16000), "channels": float64(1),
-		"frameDurationMs": float64(60), "sequenceStart": float64(0),
+		"frameDurationMs": float64(60),
 	}
 	for field, want := range expected {
 		if got := audio[field]; got != want {

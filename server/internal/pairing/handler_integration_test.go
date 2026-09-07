@@ -3,6 +3,7 @@ package pairing
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,28 @@ import (
 	"github.com/gogf/gf/v2/util/guid"
 	"stackChan/internal/meetingsecurity"
 )
+
+func TestUnauthorizedPairingReturnsHTTP401(t *testing.T) {
+	handlers := HTTPHandlers{AuthenticateUser: func(*ghttp.Request) (string, error) {
+		return "", errors.New("invalid credentials")
+	}}
+	server := g.Server(guid.S())
+	server.SetAddr("127.0.0.1:0")
+	server.SetDumpRouterMap(false)
+	server.BindHandler("GET:/stackChan/devices", handlers.Devices)
+	server.BindHandler("POST:/stackChan/bind", handlers.Bind)
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Shutdown() })
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d", server.GetListenedPort())
+	for _, route := range []struct{ method, path string }{{http.MethodGet, "/stackChan/devices"}, {http.MethodPost, "/stackChan/bind"}} {
+		body := requestJSON(t, route.method, baseURL+route.path, nil, http.StatusUnauthorized)
+		if body["code"] != "UNAUTHORIZED" {
+			t.Fatalf("unexpected error body: %#v", body)
+		}
+	}
+}
 
 func TestPairingHTTPFlowIssuesSingleUseTicketAndUnbinds(t *testing.T) {
 	repository := NewMemoryRepository(time.Now)

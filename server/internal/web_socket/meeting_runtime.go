@@ -63,7 +63,6 @@ func controlPayload(message meeting.ControlMessage) *[]byte {
 			"sampleRate":      16000,
 			"channels":        1,
 			"frameDurationMs": 60,
-			"sequenceStart":   0,
 		}
 	}
 	encoded, _ := json.Marshal(body)
