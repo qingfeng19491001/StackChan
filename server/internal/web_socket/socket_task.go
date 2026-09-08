@@ -21,7 +21,10 @@ var (
 )
 
 const (
-	ClientExpireTimeout = 15 * time.Second
+	// Allow several missed heartbeat cycles before declaring a device offline.
+	// The cleanup job runs every 15 seconds, so this gives the connection up to
+	// four checks to recover from Wi-Fi/Cloudflare jitter.
+	ClientExpireTimeout = 60 * time.Second
 )
 
 // StartPingTime sends Ping messages to all connected clients for heartbeat detection

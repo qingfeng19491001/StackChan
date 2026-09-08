@@ -26,6 +26,22 @@ func TestMeetingTransportPublishesRemoteDeviceDeliveryWhenNotLocal(t *testing.T)
 	}
 }
 
+func TestDisconnectedLocalDeviceOverridesStaleClusterPresence(t *testing.T) {
+	mac := "AA2334455667"
+	client := model.NewStackChanClient(mac, nil, nil, nil, false)
+	defer client.CloseWriterCoroutine()
+	stackChanClientPool.Store(mac, client)
+	defer stackChanClientPool.Delete(mac)
+
+	// Redis may still carry presence for a previous socket generation. Once
+	// this process has observed its local device socket close, REST/ticket
+	// callers must see the device as offline.
+	withMeetingCluster(t, &testMeetingCluster{nodeID: "node-a"})
+	if generation, online := DeviceConnectionGeneration(mac); online || generation != 0 {
+		t.Fatalf("disconnected local device reported online: generation=%d online=%v", generation, online)
+	}
+}
+
 func TestClusterOwnerRouteRequiresOwningNode(t *testing.T) {
 	server, peer := websocketPair(t)
 	defer peer.Close()

@@ -113,15 +113,25 @@ func DeviceConnectionGeneration(mac string) (uint64, bool) {
 	if err != nil {
 		return 0, false
 	}
+	// A local client entry with a nil socket is authoritative for this
+	// process.  Do not let a stale Redis presence record (or a persisted
+	// binding) make /devices report the device online after the local read loop
+	// observed a Cloudflare 1006/EOF disconnect.
+	if client := getStackChanClient(mac); client != nil {
+		generation := client.ConnectionGeneration()
+		if client.GetConn() == nil {
+			return 0, false
+		}
+		if cluster := currentMeetingCluster(); cluster.NodeID() != "" {
+			return cluster.DeviceGeneration(context.Background(), mac)
+		}
+		return generation, true
+	}
 	cluster := currentMeetingCluster()
 	if cluster.NodeID() != "" {
 		return cluster.DeviceGeneration(context.Background(), mac)
 	}
-	client := getStackChanClient(mac)
-	if client == nil || client.GetConn() == nil {
-		return 0, false
-	}
-	return client.ConnectionGeneration(), true
+	return 0, false
 }
 
 // Handler WebSocket handler function
