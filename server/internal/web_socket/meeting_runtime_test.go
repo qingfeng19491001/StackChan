@@ -32,6 +32,65 @@ func TestStartCommandMatchesFirmwareAudioSchema(t *testing.T) {
 	}
 }
 
+func TestMeetingStartImmediatelyReturnsDeviceOfflineAfterSocketDisconnect(t *testing.T) {
+	deviceServer, devicePeer := websocketPair(t)
+	defer deviceServer.Close()
+	defer devicePeer.Close()
+	appServer, appPeer := websocketPair(t)
+	defer appPeer.Close()
+
+	mac := "AABBCCDDEEFF"
+	device := model.NewStackChanClient(mac, deviceServer, nil, nil, false)
+	defer device.CloseWriterCoroutine()
+	deviceGeneration := device.ConnectionGeneration()
+	if !device.SelectMeetingV1(deviceGeneration) {
+		t.Fatal("failed to select meeting-v1 for test device")
+	}
+	if !device.ClearConnection(deviceGeneration) {
+		t.Fatal("failed to simulate device disconnect")
+	}
+	stackChanClientPool.Store(mac, device)
+	defer stackChanClientPool.Delete(mac)
+
+	app := model.NewAppClient(mac, appServer, "phone")
+	defer app.CloseWriterCoroutine()
+	app.SetUserID("owner")
+	app.SetMeetingAuthorization("owner", "phone", app.ConnectionGeneration())
+	app.SelectMeetingV1(app.ConnectionGeneration())
+
+	previousRepository := pairing.DefaultRepository
+	repository := pairing.NewMemoryRepository(time.Now)
+	nonce, _ := repository.IssueNonce(mac, deviceGeneration)
+	if err := repository.Bind("owner", mac, nonce.Value, deviceGeneration); err != nil {
+		t.Fatal(err)
+	}
+	pairing.DefaultRepository = repository
+	defer func() { pairing.DefaultRepository = previousRepository }()
+
+	request := wsprotocol.MeetingControl{
+		ProtocolVersion: 1,
+		Action:          "meeting.start",
+		MessageID:       uuid.NewString(),
+		CommandID:       uuid.NewString(),
+		SessionID:       uuid.NewString(),
+		MAC:             mac,
+		Audio:           &wsprotocol.MeetingAudioParameters{Codec: "opus", SampleRate: 16000, Channels: 1, FrameDurationMS: 60},
+	}
+	payload, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handleAppMeetingControl(context.Background(), app, payload)
+
+	response := parseControlMap(t, readBinaryMessage(t, appPeer))
+	if response["action"] != "meeting.error" || response["code"] != "DEVICE_OFFLINE" {
+		t.Fatalf("response = %+v", response)
+	}
+	if response["sessionId"] != request.SessionID || response["commandId"] != request.CommandID {
+		t.Fatalf("offline error does not identify rejected command: %+v", response)
+	}
+}
+
 func TestDeviceRequestedMeetingStartsOnlyAfterBoundAuroAccepts(t *testing.T) {
 	deviceServer, devicePeer := websocketPair(t)
 	defer devicePeer.Close()

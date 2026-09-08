@@ -100,10 +100,17 @@ func sendBoundAppsLocal(ctx context.Context, mac string, message meeting.Control
 }
 
 func (wsMeetingTransport) SendDevice(ctx context.Context, mac string, message meeting.ControlMessage) error {
-	if err := sendDeviceLocal(ctx, mac, message); err == nil {
-		return nil
+	// A local registry entry is authoritative even after its socket has been
+	// cleared. Preserve ErrDeviceOffline instead of replacing it with a generic
+	// cluster-publish error in the single-instance deployment.
+	if getStackChanClient(mac) != nil {
+		return sendDeviceLocal(ctx, mac, message)
 	}
-	return currentMeetingCluster().Publish(ctx, clusterDelivery{Kind: clusterToDevice, MAC: mac, Control: &message})
+	cluster := currentMeetingCluster()
+	if cluster.NodeID() == "" {
+		return meeting.ErrDeviceOffline
+	}
+	return cluster.Publish(ctx, clusterDelivery{Kind: clusterToDevice, MAC: mac, Control: &message})
 }
 
 func sendDeviceLocal(ctx context.Context, mac string, message meeting.ControlMessage) error {
