@@ -76,8 +76,9 @@ func (s SpeakerIdentificationService) Create(ctx context.Context, audio io.Reade
 		speakers = append(speakers, item)
 	}
 	body := map[string]any{
-		"audio_url":      uploadURL,
-		"speaker_labels": true,
+		"audio_url":          uploadURL,
+		"language_detection": true,
+		"speaker_labels":     true,
 		"speech_understanding": map[string]any{"request": map[string]any{
 			"speaker_identification": map[string]any{
 				"speaker_type": config.SpeakerType,
@@ -137,6 +138,7 @@ func (s SpeakerIdentificationService) Query(ctx context.Context, transcriptID st
 				SpeakerIdentification struct {
 					Status  string            `json:"status"`
 					Mapping map[string]string `json:"mapping"`
+					Error   string            `json:"error"`
 				} `json:"speaker_identification"`
 			} `json:"response"`
 		} `json:"speech_understanding"`
@@ -152,9 +154,19 @@ func (s SpeakerIdentificationService) Query(ctx context.Context, transcriptID st
 	if status == "error" {
 		status = "failed"
 	}
+	identification := response.SpeechUnderstanding.Response.SpeakerIdentification
+	if status == "completed" && identification.Status != "success" {
+		status = "failed"
+		if response.Error == "" {
+			response.Error = identification.Error
+		}
+		if response.Error == "" {
+			response.Error = "AssemblyAI speaker identification did not succeed"
+		}
+	}
 	return IdentificationResult{
 		Status:     status,
-		Mapping:    response.SpeechUnderstanding.Response.SpeakerIdentification.Mapping,
+		Mapping:    identification.Mapping,
 		Utterances: response.Utterances,
 		Error:      response.Error,
 	}, nil

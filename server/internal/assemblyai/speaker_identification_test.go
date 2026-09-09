@@ -28,7 +28,7 @@ func TestSpeakerIdentificationCreateAndQuery(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatal(err)
 			}
-			if body["speaker_labels"] != true || body["audio_url"] != "https://upload.test/audio" {
+			if body["speaker_labels"] != true || body["language_detection"] != true || body["audio_url"] != "https://upload.test/audio" {
 				t.Fatalf("unexpected submit body: %#v", body)
 			}
 			understanding := body["speech_understanding"].(map[string]any)
@@ -92,5 +92,26 @@ func TestSpeakerIdentificationQueryPropagatesProcessingAndFailure(t *testing.T) 
 	second, err := service.Query(context.Background(), "transcript-1")
 	if err != nil || second.Status != "failed" || second.Error != "bad audio" {
 		t.Fatalf("second=%+v err=%v", second, err)
+	}
+}
+
+func TestSpeakerIdentificationQueryRejectsFailedIdentificationOnCompletedTranscript(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"status":"completed",
+			"speech_understanding":{"response":{"speaker_identification":{"status":"error","error":"could not identify speakers"}}},
+			"utterances":[{"speaker":"A","text":"hello","start":0,"end":1000,"confidence":0.9}]
+		}`))
+	}))
+	defer server.Close()
+
+	service := SpeakerIdentificationService{APIKey: "test-key", APIBaseURL: server.URL, HTTPClient: server.Client()}
+	result, err := service.Query(context.Background(), "transcript-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "failed" || result.Error != "could not identify speakers" {
+		t.Fatalf("unexpected result: %+v", result)
 	}
 }
