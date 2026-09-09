@@ -10,9 +10,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	assemblyaiservice "stackChan/internal/assemblyai"
 	"stackChan/internal/boot"
 	"stackChan/internal/controller/admin"
 	"stackChan/internal/controller/appstore"
+	assemblyaicontroller "stackChan/internal/controller/assemblyai"
 	"stackChan/internal/controller/dance"
 	"stackChan/internal/controller/device"
 	"stackChan/internal/controller/file"
@@ -91,12 +93,22 @@ var (
 				RequestPolicy:      web_socket.MeetingRequestPolicy(),
 				RateLimiter:        web_socket.NewPairingRateLimiter(),
 			}
+			speakerIdentificationHandlers := assemblyaicontroller.SpeakerIdentificationHandlers{
+				AuthenticateUser: authenticateUser,
+				Service:          assemblyaiservice.NewSpeakerIdentificationService(),
+				Signer: assemblyaiservice.JobTokenSigner{
+					Secret: []byte(os.Getenv("ASSEMBLYAI_JOB_SIGNING_SECRET")),
+				},
+			}
 			s.BindHandler("POST:/stackChan/pairing-nonce", pairingHandlers.PairingNonce)
 			s.BindHandler("POST:/stackChan/bind", pairingHandlers.Bind)
 			s.BindHandler("GET:/stackChan/devices", pairingHandlers.Devices)
 			s.BindHandler("POST:/stackChan/unbind", pairingHandlers.Unbind)
 			s.BindHandler("DELETE:/stackChan/bind/:mac", pairingHandlers.UnbindPath)
 			s.BindHandler("POST:/stackChan/ws-ticket", pairingHandlers.WSTicket)
+			s.BindHandler("GET:/stackChan/assemblyai/streaming-token", assemblyaicontroller.StreamingToken)
+			s.BindHandler("POST:/stackChan/assemblyai/speaker-identification/jobs", speakerIdentificationHandlers.Create)
+			s.BindHandler("POST:/stackChan/assemblyai/speaker-identification/jobs/query", speakerIdentificationHandlers.Query)
 			if metricsToken := os.Getenv("STACKCHAN_METRICS_TOKEN"); metricsToken != "" {
 				metricsHandler := meetingmetrics.AuthorizedHandler(meetingmetrics.Default, metricsToken)
 				s.BindHandler("GET:/stackChan/metrics", func(r *ghttp.Request) {
