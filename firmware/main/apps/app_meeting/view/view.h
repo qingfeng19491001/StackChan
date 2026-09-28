@@ -150,7 +150,8 @@ private:
 
     void applyPairingLayout()
     {
-        const bool show_pairing = _has_pairing_qr && _state == MeetingUiState::Ready;
+        const bool show_pairing = _has_pairing_qr &&
+            (_state == MeetingUiState::Ready || _state == MeetingUiState::Preparing);
         if (_pairing_qr) {
             _pairing_qr->setHidden(!show_pairing);
         }

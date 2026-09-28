@@ -40,6 +40,12 @@ cmake-build-*/
 /components/
 managed_components/
 
+# Local build and test artifacts
+/build-*.log
+/idf-python-install.log*
+/tests/build-state-policy/
+/tests/build-state-policy-ninja/
+
 # PlatformIO
 .pio/
 
@@ -63,5 +69,6 @@ obj/
 
 sdkconfig
 sdkconfig.old
+sdkconfig.defaults.local
 
 xiaozhi-esp32/

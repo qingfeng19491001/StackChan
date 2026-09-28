@@ -63,6 +63,30 @@ int strict_schema_and_direction()
     return 0;
 }
 
+int stop_schema_is_exact()
+{
+    MeetingControlDocument doc;
+    doc.payload_bytes = 128;
+    doc.root_field_count = 5;
+    doc.protocol_version_is_integer = true;
+    doc.protocol_version = 1;
+    doc.action_is_string = true;
+    doc.action = "meeting.stop";
+    doc.message_id_is_string = true;
+    doc.message_id = "00112233-4455-4677-8899-aabbccddeeff";
+    doc.command_id_is_string = true;
+    doc.command_id = "11112233-4455-4677-8899-aabbccddeeff";
+    doc.session_id_is_string = true;
+    doc.session_id = "22222233-4455-4677-8899-aabbccddeeff";
+    if (ValidateInboundMeetingControl(doc).error != MeetingControlError::None) return __LINE__;
+    doc.root_field_count = 6;
+    if (ValidateInboundMeetingControl(doc).error != MeetingControlError::InvalidField) return __LINE__;
+    doc.root_field_count = 5;
+    doc.mac_present = true;
+    if (ValidateInboundMeetingControl(doc).error != MeetingControlError::WrongDirection) return __LINE__;
+    return 0;
+}
+
 int selected_capability_is_exact()
 {
     MeetingControlDocument doc;
@@ -105,6 +129,8 @@ int meeting_error_code_is_stable()
     }
     doc.code = "DEVICE_ERROR";
     if (ValidateInboundMeetingControl(doc).error != MeetingControlError::None) return __LINE__;
+    doc.code = "RATE_LIMITED";
+    if (ValidateInboundMeetingControl(doc).error != MeetingControlError::None) return __LINE__;
     return 0;
 }
 
@@ -113,6 +139,7 @@ int meeting_error_code_is_stable()
 extern "C" int run_tests()
 {
     if (const int result = strict_schema_and_direction()) return result;
+    if (const int result = stop_schema_is_exact()) return result;
     if (const int result = selected_capability_is_exact()) return result;
     return meeting_error_code_is_stable();
 }

@@ -853,9 +853,6 @@ private:
         response["protocolVersion"] = 1;
         response["action"] = "meeting.error";
         response["messageId"] = createMessageId();
-        if (IsMeetingUuid(event.messageId.c_str())) {
-            response["correlationMessageId"] = normalizedUuid(event.messageId.c_str());
-        }
         if (IsMeetingUuid(event.commandId.c_str())) {
             response["commandId"] = normalizedUuid(event.commandId.c_str());
         }
