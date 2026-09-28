@@ -125,6 +125,7 @@ foreach(policy_test IN ITEMS
     meeting_app_failure_policy_test
     meeting_outcome_replay_policy_test
     meeting_callback_shutdown_test
+    meeting_ui_state_policy_test
 )
     add_executable(${policy_test} ${policy_test}.cpp)
     target_include_directories(${policy_test} PRIVATE

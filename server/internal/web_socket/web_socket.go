@@ -203,6 +203,7 @@ func Handler(r *ghttp.Request) {
 					// A device attachment cannot resume an existing recording. End
 					// the old session before accepting capability negotiation from
 					// the replacement generation.
+					observeMeetingDisconnect(ctx, mac, "device_replaced")
 					meetingManager.OnDeviceDisconnect(ctx, mac)
 					meetingmetrics.Default.IncReconnect()
 					_ = previous.Close()
@@ -261,6 +262,7 @@ func Handler(r *ghttp.Request) {
 				if cluster := currentMeetingCluster(); cluster.NodeID() != "" {
 					_ = cluster.UnregisterDevice(context.Background(), mac, presenceGeneration)
 				}
+				observeMeetingDisconnect(ctx, mac, "device_socket_closed")
 				meetingManager.OnDeviceDisconnect(ctx, mac)
 				meetingmetrics.Default.SetOnlineDevices(int64(connectedDeviceCount()))
 			}
@@ -318,6 +320,7 @@ func Handler(r *ghttp.Request) {
 					// Start the bounded owner reattach window for the attachment
 					// that was replaced. A newly ticketed generation must still send
 					// meeting.reattach; merely opening a socket does not preserve it.
+					logger.Warningf(ctx, "[SCMEET-DIAG] owner.disconnect mac=%s generation=%d reason=socket_replaced", mac, generation-1)
 					meetingManager.OnOwnerDisconnect(ctx, meeting.Owner{
 						NodeID: currentMeetingNodeID(), MAC: mac,
 						UserID: client.GetUserID(), DeviceID: client.GetDeviceId(),
@@ -361,6 +364,7 @@ func Handler(r *ghttp.Request) {
 			logger.Info(ctx, "There is an App that has disconnected.", mac, deviceType)
 			_ = ws.Close()
 			if client.ClearConnection(connectionGeneration) {
+				logger.Warningf(ctx, "[SCMEET-DIAG] owner.disconnect mac=%s generation=%d", mac, connectionGeneration)
 				meetingManager.OnOwnerDisconnect(ctx, meeting.Owner{NodeID: currentMeetingNodeID(), MAC: mac, UserID: client.GetUserID(), DeviceID: client.GetDeviceId(), Generation: connectionGeneration})
 			}
 		}()
@@ -481,15 +485,21 @@ func readStackChanMessage(ctx context.Context, client *model.StackChanClient, me
 			handleDeviceMeetingControl(ctx, client, payload)
 			return
 		}
-		if msgType == Opus && client.SupportsMeetingV1(client.ConnectionGeneration()) && meetingManager.Active(client.GetMac()) != nil {
-			if err := meetingManager.OnAudio(ctx, client.GetMac(), payload); err != nil {
-				request := wsprotocol.MeetingControl{}
-				if frame, decodeErr := wsprotocol.DecodeMeetingAudio(payload); decodeErr == nil {
-					request.SessionID = frame.SessionID.String()
+		if msgType == Opus && client.SupportsMeetingV1(client.ConnectionGeneration()) {
+			if meetingManager.Active(client.GetMac()) != nil {
+				if err := meetingManager.OnAudio(ctx, client.GetMac(), payload); err != nil {
+					observeMeetingAudioReject(ctx, client.GetMac(), payload, err)
+					request := wsprotocol.MeetingControl{}
+					if frame, decodeErr := wsprotocol.DecodeMeetingAudio(payload); decodeErr == nil {
+						request.SessionID = frame.SessionID.String()
+					}
+					notifyMeetingOwnerError(ctx, client.GetMac(), request, err)
+				} else if frame, decodeErr := wsprotocol.DecodeMeetingAudio(payload); decodeErr == nil {
+					observeMeetingAudioOK(ctx, client.GetMac(), frame)
 				}
-				notifyMeetingOwnerError(ctx, client.GetMac(), request, err)
+				return
 			}
-			return
+			observeMeetingAudioDrop(ctx, client.GetMac(), "no_active_session")
 		}
 		switch msgType {
 		case pong:

@@ -34,6 +34,12 @@ int incomplete_terminal_requires_enqueue_and_flush_disposition()
     }
     if (!ShouldCommitStoppedCommand(true)) return __LINE__;
     if (ShouldCommitStoppedCommand(false)) return __LINE__;
+    if (!ShouldReturnReadyAfterStop(true, false)) return __LINE__;
+    if (!ShouldReturnReadyAfterStop(false, true)) return __LINE__;
+    if (ShouldReturnReadyAfterStop(false, false)) return __LINE__;
+    if (ShouldReportStopAsDeviceError(false, false, false)) return __LINE__;
+    if (ShouldReportStopAsDeviceError(true, true, false)) return __LINE__;
+    if (!ShouldReportStopAsDeviceError(true, false, false)) return __LINE__;
     return 0;
 }
 

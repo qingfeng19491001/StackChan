@@ -23,6 +23,17 @@ namespace {
 constexpr const char* TAG = "MeetingAudioBridge";
 constexpr size_t kMaxBridgePendingFrames = 2;
 constexpr size_t kMaxCachedControlOutcomes = 16;
+constexpr int64_t kDiagHealthIntervalUs = 5'000'000;
+constexpr int64_t kDiagEnqueueFailIntervalUs = 2'000'000;
+
+const char* FormatOptionalU32(const std::optional<uint32_t>& value, char (&buf)[16])
+{
+    if (!value.has_value()) {
+        return "none";
+    }
+    std::snprintf(buf, sizeof(buf), "%u", *value);
+    return buf;
+}
 
 std::string createMessageId()
 {
@@ -67,11 +78,6 @@ BridgePrepareResult MeetingAudioBridge::prepare()
     std::lock_guard<std::mutex> lock(mutex_);
     if (audio_service_ != nullptr) {
         return BridgePrepareResult::AlreadyReady;
-    }
-
-    const auto transport = GetHAL().getMeetingTransportSnapshot();
-    if (!transport.connected || !transport.protocolSelected) {
-        return BridgePrepareResult::TransportUnavailable;
     }
 
     auto audio_service = std::make_unique<AudioService>(true);
@@ -123,12 +129,17 @@ BridgeStartResult MeetingAudioBridge::start(
         pending_packets_.clear();
         last_attempted_sequence_.reset();
         last_enqueued_sequence_.reset();
+        last_diag_log_us_ = 0;
+        last_diag_enqueue_fail_us_ = 0;
+        last_diag_enqueued_.reset();
         if (!GetHAL().beginMeetingTransportSession()) {
+            ESP_LOGW(TAG, "[SCMEET-DIAG] start.rejected session=%s reason=TransportUnavailable", session_id.c_str());
             return BridgeStartResult::TransportUnavailable;
         }
         const auto start_result = audio_service_->Start();
         if (start_result != AudioServiceStartResult::Started &&
             start_result != AudioServiceStartResult::AlreadyStarted) {
+            ESP_LOGW(TAG, "[SCMEET-DIAG] start.rejected session=%s reason=TaskStartFailed", session_id.c_str());
             return BridgeStartResult::TaskStartFailed;
         }
         running_ = true;
@@ -136,6 +147,13 @@ BridgeStartResult MeetingAudioBridge::start(
 
     const auto started_control = enqueueControl("meeting.started", command_id, 0);
     if (!started_control.enqueued && !started_control.locally_accepted) {
+        ESP_LOGW(
+            TAG,
+            "[SCMEET-DIAG] start.ack_failed session=%s enqueued=%d accepted=%d",
+            session_id.c_str(),
+            started_control.enqueued ? 1 : 0,
+            started_control.locally_accepted ? 1 : 0
+        );
         abort();
         return BridgeStartResult::StartedAckFailed;
     }
@@ -146,8 +164,10 @@ BridgeStartResult MeetingAudioBridge::start(
         processor_result != AudioServiceVoiceResult::AlreadyInState) {
         running_ = false;
         audio_service_->Stop();
+        ESP_LOGW(TAG, "[SCMEET-DIAG] start.rejected session=%s reason=ProcessorStartFailed", session_id.c_str());
         return BridgeStartResult::ProcessorStartFailed;
     }
+    ESP_LOGI(TAG, "[SCMEET-DIAG] start.ok session=%s", session_id.c_str());
     return BridgeStartResult::Started;
 }
 
@@ -257,11 +277,24 @@ BridgeStopResult MeetingAudioBridge::stopAndDrain(
         enqueued_evidence = last_enqueued_sequence_;
     }
     auto makeResult = [&](BridgeStopStatus status, MeetingError error, bool terminal_known = false) {
+        char last_buf[16];
+        char accepted_buf[16];
+        const auto accepted = acceptedSequence();
+        ESP_LOGW(
+            TAG,
+            "[SCMEET-DIAG] stop.incomplete status=%d error=%d lastSequence=%s accepted=%s terminalKnown=%d transportOk=%d",
+            static_cast<int>(status),
+            static_cast<int>(error),
+            FormatOptionalU32(last_sequence, last_buf),
+            FormatOptionalU32(accepted, accepted_buf),
+            terminal_known ? 1 : 0,
+            transport_ok ? 1 : 0
+        );
         return BridgeStopResult{
             status,
             false,
             last_sequence,
-            acceptedSequence(),
+            accepted,
             error,
             attempted_evidence,
             enqueued_evidence,
@@ -307,13 +340,13 @@ BridgeStopResult MeetingAudioBridge::stopAndDrain(
     };
 
     if (drain_result == AudioServiceDrainResult::EncoderFailed) {
-        if (!sendTerminalControl("encode_failed")) {
+        if (!sendTerminalControl("error")) {
             return makeResult(BridgeStopStatus::TransportFailed, MeetingError::FinalDispositionUnknown);
         }
         return makeResult(BridgeStopStatus::AudioEncodeFailed, MeetingError::AudioEncodeFailed, true);
     }
     if (drain_result == AudioServiceDrainResult::IncompleteProcessorTail) {
-        if (!sendTerminalControl("incomplete_audio")) {
+        if (!sendTerminalControl("error")) {
             return makeResult(BridgeStopStatus::TransportFailed, MeetingError::FinalDispositionUnknown);
         }
         return makeResult(BridgeStopStatus::IncompleteAudio, MeetingError::IncompleteAudio, true);
@@ -322,7 +355,15 @@ BridgeStopResult MeetingAudioBridge::stopAndDrain(
         return makeResult(BridgeStopStatus::TransportFailed, MeetingError::FinalDispositionUnknown);
     }
     const auto accepted_sequence = acceptedSequence();
+    char last_buf[16];
+    char accepted_buf[16];
     if (last_sequence.has_value() && accepted_sequence != last_sequence) {
+        ESP_LOGW(
+            TAG,
+            "[SCMEET-DIAG] stop.sequence_mismatch lastSequence=%s accepted=%s",
+            FormatOptionalU32(last_sequence, last_buf),
+            FormatOptionalU32(accepted_sequence, accepted_buf)
+        );
         return BridgeStopResult{
             BridgeStopStatus::TransportFailed,
             false,
@@ -335,6 +376,12 @@ BridgeStopResult MeetingAudioBridge::stopAndDrain(
             terminal_control,
         };
     }
+    ESP_LOGI(
+        TAG,
+        "[SCMEET-DIAG] stop.ok lastSequence=%s accepted=%s",
+        FormatOptionalU32(last_sequence, last_buf),
+        FormatOptionalU32(accepted_sequence, accepted_buf)
+    );
     return {
         BridgeStopStatus::Complete,
         true,
@@ -425,6 +472,17 @@ BridgeAbortResult MeetingAudioBridge::abort(MeetingError cause)
             audio_service_.reset();
         }
     }
+    char attempted_buf[16];
+    char enqueued_buf[16];
+    char accepted_buf[16];
+    ESP_LOGW(
+        TAG,
+        "[SCMEET-DIAG] abort cause=%d attempted=%s enqueued=%s accepted=%s",
+        static_cast<int>(cause),
+        FormatOptionalU32(result.last_attempted_sequence, attempted_buf),
+        FormatOptionalU32(result.last_enqueued_sequence, enqueued_buf),
+        FormatOptionalU32(result.last_transport_accepted_sequence, accepted_buf)
+    );
     return result;
 }
 
@@ -460,13 +518,42 @@ BridgeHealthSnapshot MeetingAudioBridge::inspectTransportHealth()
             health.error = MeetingError::TransportUnavailable;
         }
     }
+    if (transport.hasLocalSocketAcceptedSequence) {
+        health.last_transport_accepted_sequence = transport.lastLocalSocketAcceptedSequence;
+    }
+    char attempted_buf[16];
+    char enqueued_buf[16];
+    char accepted_buf[16];
+    size_t pending = 0;
+    uint32_t next_sequence = 0;
+    bool should_log = false;
+    bool stalled = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         health.last_attempted_sequence = last_attempted_sequence_;
         health.last_enqueued_sequence = last_enqueued_sequence_;
+        pending = pending_packets_.size();
+        next_sequence = next_sequence_;
+        const int64_t now_us = esp_timer_get_time();
+        should_log = running_ && (last_diag_log_us_ == 0 || now_us - last_diag_log_us_ >= kDiagHealthIntervalUs);
+        if (should_log) {
+            stalled = last_diag_log_us_ != 0 && last_diag_enqueued_ == last_enqueued_sequence_;
+            last_diag_log_us_ = now_us;
+            last_diag_enqueued_ = last_enqueued_sequence_;
+        }
     }
-    if (transport.hasLocalSocketAcceptedSequence) {
-        health.last_transport_accepted_sequence = transport.lastLocalSocketAcceptedSequence;
+    if (should_log) {
+        ESP_LOGI(
+            TAG,
+            "[SCMEET-DIAG] audio.health pending=%u next=%u attempted=%s enqueued=%s accepted=%s latched=%d stalled=%d",
+            static_cast<unsigned>(pending),
+            next_sequence,
+            FormatOptionalU32(health.last_attempted_sequence, attempted_buf),
+            FormatOptionalU32(health.last_enqueued_sequence, enqueued_buf),
+            FormatOptionalU32(health.last_transport_accepted_sequence, accepted_buf),
+            health.failure_latched ? 1 : 0,
+            stalled ? 1 : 0
+        );
     }
     return health;
 }
@@ -521,6 +608,18 @@ MeetingEnqueueDisposition_t MeetingAudioBridge::enqueuePacketLocked(
         last_enqueued_sequence_ = next_sequence_;
         ++next_sequence_;
         packet.reset();
+    } else {
+        const int64_t now_us = esp_timer_get_time();
+        if (last_diag_enqueue_fail_us_ == 0 || now_us - last_diag_enqueue_fail_us_ >= kDiagEnqueueFailIntervalUs) {
+            last_diag_enqueue_fail_us_ = now_us;
+            ESP_LOGW(
+                TAG,
+                "[SCMEET-DIAG] audio.enqueue_failed seq=%u error=%d pending=%u",
+                next_sequence_,
+                static_cast<int>(result.error),
+                static_cast<unsigned>(pending_packets_.size())
+            );
+        }
     }
     return result;
 }
@@ -556,6 +655,15 @@ MeetingEnqueueDisposition_t MeetingAudioBridge::enqueueControl(
     std::string json;
     ArduinoJson::serializeJson(doc, json);
     const auto disposition = GetHAL().enqueueMeetingControl(json);
+    char seq_buf[16];
+    ESP_LOGI(
+        TAG,
+        "[SCMEET-DIAG] control.enqueue action=%s lastSequence=%s enqueued=%d accepted=%d",
+        action,
+        FormatOptionalU32(sequence, seq_buf),
+        disposition.enqueued ? 1 : 0,
+        disposition.locally_accepted ? 1 : 0
+    );
     rememberOutcome(
         std::string_view(action) == "meeting.started"
             ? BridgeOutcomeKind::Started

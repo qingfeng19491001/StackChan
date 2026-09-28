@@ -98,7 +98,8 @@ constexpr bool IsStableMeetingErrorCode(const char* code)
         MeetingStringEquals(code, "SERVER_DISCONNECTED") ||
         MeetingStringEquals(code, "DEVICE_ERROR") ||
         MeetingStringEquals(code, "WRITE_FAILED") ||
-        MeetingStringEquals(code, "PROTOCOL_UNSUPPORTED");
+        MeetingStringEquals(code, "PROTOCOL_UNSUPPORTED") ||
+        MeetingStringEquals(code, "RATE_LIMITED");
 }
 
 constexpr MeetingControlValidation ValidateInboundMeetingControl(

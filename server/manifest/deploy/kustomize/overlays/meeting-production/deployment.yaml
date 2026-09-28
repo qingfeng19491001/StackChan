@@ -13,6 +13,21 @@ spec:
             # Do not put a ticket/device credential into a ConfigMap.
             - name: STACKCHAN_REQUIRE_TLS
               value: "true"
+            # AssemblyAI permanent key is used only by the server to mint
+            # one-time streaming tokens. Populate this key in the deployment
+            # secret before enabling meeting transcription.
+            - name: ASSEMBLYAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: stackchan-meeting-secrets
+                  key: assemblyaiApiKey
+                  optional: true
+            - name: ASSEMBLYAI_JOB_SIGNING_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: stackchan-meeting-secrets
+                  key: assemblyaiJobSigningSecret
+                  optional: false
             # Verify the access token sent by Auro and use its Supabase user
             # id to isolate bound devices between users. JWKS is public.
             - name: SUPABASE_JWKS_URL

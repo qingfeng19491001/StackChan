@@ -139,6 +139,9 @@ private:
     bool running_ = false;
     std::optional<uint32_t> last_attempted_sequence_;
     std::optional<uint32_t> last_enqueued_sequence_;
+    int64_t last_diag_log_us_ = 0;
+    int64_t last_diag_enqueue_fail_us_ = 0;
+    std::optional<uint32_t> last_diag_enqueued_;
 
     struct CachedControlOutcome {
         BridgeOutcomeKind kind = BridgeOutcomeKind::Started;

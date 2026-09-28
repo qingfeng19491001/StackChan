@@ -13,8 +13,28 @@
 #include <esp_system.h>
 #include <stackchan/meeting_stop_policy.h>
 #include <stackchan/meeting_app_failure_policy.h>
+#include <stackchan/meeting_ui_state_policy.h>
 
 using namespace mooncake;
+
+namespace {
+
+view::MeetingUiState ToViewMeetingUiState(MeetingUiStateResolution state)
+{
+    switch (state) {
+        case MeetingUiStateResolution::Disconnected: return view::MeetingUiState::Disconnected;
+        case MeetingUiStateResolution::Reconnecting: return view::MeetingUiState::Reconnecting;
+        case MeetingUiStateResolution::Ready: return view::MeetingUiState::Ready;
+        case MeetingUiStateResolution::Preparing: return view::MeetingUiState::Preparing;
+        case MeetingUiStateResolution::Recording: return view::MeetingUiState::Recording;
+        case MeetingUiStateResolution::Stopping: return view::MeetingUiState::Stopping;
+    }
+    return view::MeetingUiState::Error;
+}
+
+constexpr uint32_t kLocalStopConfirmationTimeoutMs = 12'000;
+
+}  // namespace
 
 AppMeeting::AppMeeting()
 {
@@ -32,6 +52,15 @@ AppMeeting::AppMeeting()
 void AppMeeting::onCreate()
 {
     mclog::tagInfo(getAppInfo().name, "on create");
+
+    // Audio processor initialization is intentionally completed before the
+    // device WebSocket is started in app_main. Once the device is advertised
+    // online, meeting.start must remain a short command/acknowledgement path.
+    const auto prepared = _audio_bridge.prepare();
+    if (prepared != stackchan::meeting::BridgePrepareResult::Ready &&
+        prepared != stackchan::meeting::BridgePrepareResult::AlreadyReady) {
+        _meeting_error_latched.store(true);
+    }
 
     _meeting_command_connection = GetHAL().onWsMeetingCommand.connect(
         [this](const WsMeetingCommand_t& command) { handleMeetingCommand(command); }
@@ -72,9 +101,10 @@ void AppMeeting::onOpen()
     _page->onAction([this]() { handleLocalAction(); });
     _page->setState(_meeting_error_latched.load()
                         ? view::MeetingUiState::Error
-                        : (transport.connected
-                               ? view::MeetingUiState::Ready
-                               : view::MeetingUiState::Disconnected));
+                        : ToViewMeetingUiState(ResolveMeetingUiState(
+                              transport.connected, transport.protocolSelected, _audio_bridge.isRunning(),
+                              false, false
+                          )));
 
     view::create_home_indicator([this]() {
         if (_audio_bridge.isRunning()) {
@@ -94,6 +124,7 @@ void AppMeeting::onRunning()
     bool selected = false;
     bool awaiting_start_offer = false;
     bool event_pending = false;
+    bool awaiting_local_stop = false;
     {
         std::lock_guard<std::mutex> state_lock(_command_mutex);
         connected = _connected;
@@ -101,6 +132,14 @@ void AppMeeting::onRunning()
         awaiting_start_offer = _awaiting_start_offer;
         event_pending = _meeting_event_pending;
         _meeting_event_pending = false;
+        if (_pending_local_stop.has_value()) {
+            const uint32_t now = GetHAL().millis();
+            if (static_cast<int32_t>(now - _pending_local_stop->deadline_ms) >= 0) {
+                _pending_local_stop.reset();
+            } else {
+                awaiting_local_stop = true;
+            }
+        }
     }
     std::optional<stackchan::meeting::BridgeHealthSnapshot> transport_health;
     if (!event_pending && _audio_bridge.isRunning()) {
@@ -120,7 +159,7 @@ void AppMeeting::onRunning()
             aborted = _audio_bridge.abort(stackchan::meeting::MeetingError::ProtocolRejected);
         }
         if (!failed.sessionId.empty() && !failed.commandId.empty()) {
-            aborted.error_control = sendError(failed, "DEVICE_ERROR", &aborted);
+            aborted.error_control = sendError(failed, "DEVICE_ERROR");
             markStartFailed(failed.sessionId, failed.commandId);
         } else {
             GetHAL().abortMeetingCommandState();
@@ -145,19 +184,26 @@ void AppMeeting::onRunning()
         const char* code = health.error == stackchan::meeting::MeetingError::TransportUnavailable
             ? "SERVER_DISCONNECTED"
             : "WRITE_FAILED";
-        aborted.error_control = sendError(failed, code, &aborted);
+        mclog::tagWarn(
+            getAppInfo().name,
+            "[SCMEET-DIAG] transport.abort code={} error={}",
+            code,
+            static_cast<int>(health.error)
+        );
+        aborted.error_control = sendError(failed, code);
         markStartFailed(failed.sessionId, failed.commandId);
         {
             std::lock_guard<std::mutex> state_lock(_command_mutex);
             _last_abort_result = aborted;
         }
         updateUiState(view::MeetingUiState::Error);
-    } else if (_page && !awaiting_start_offer && !_meeting_error_latched.load()) {
+    } else if (_page && !_meeting_error_latched.load()) {
         // Pairing is an HTTP capability of an authenticated, online device.
         // It must not wait for meeting-v1 negotiation: that negotiation is
         // completed by the Auro WebSocket after the user scans this QR code.
-        updateUiState(connected ? view::MeetingUiState::Ready
-                                : view::MeetingUiState::Disconnected);
+        updateUiState(ToViewMeetingUiState(ResolveMeetingUiState(
+            connected, selected, _audio_bridge.isRunning(), awaiting_start_offer, awaiting_local_stop
+        )));
     }
     refreshPairingQrIfNeeded(connected, selected);
 
@@ -170,22 +216,19 @@ void AppMeeting::onClose()
 {
     mclog::tagInfo(getAppInfo().name, "on close");
 
-    const bool had_active_meeting = _audio_bridge.isRunning();
-    _audio_bridge.abort();
-    if (had_active_meeting && !_active_session_id.empty() && !_active_command_id.empty()) {
-        WsMeetingCommand_t failed;
-        failed.action = MeetingInboundAction::Start;
-        failed.sessionId = _active_session_id;
-        failed.commandId = _active_command_id;
-        sendError(failed, "DEVICE_ERROR");
-        markStartFailed(failed.sessionId, failed.commandId);
-    } else {
+    // The meeting session belongs to the control protocol, not its LVGL page.
+    // Closing the page while the phone backgrounds or changes view must not
+    // turn a healthy recording into meeting.error. A running session is ended
+    // only by meeting.stop (or by the explicit failure paths in onRunning()).
+    if (!_audio_bridge.isRunning()) {
+        _audio_bridge.abort();
         GetHAL().abortMeetingCommandState();
     }
     {
         std::lock_guard<std::mutex> state_lock(_command_mutex);
         _ui_open = false;
         _pairing_uri.clear();
+        _pending_local_stop.reset();
     }
 
     LvglLockGuard lock;
@@ -288,7 +331,14 @@ void AppMeeting::handleMeetingEvent(const MeetingEvent_t& event)
     // Rejections describe the offending inbound control and are reported to
     // the Server by HAL; they never mutate the current meeting lifecycle.
     if (event.kind == MeetingEventKind::ControlRejected ||
-        event.kind == MeetingEventKind::TransportFailure) return;
+        event.kind == MeetingEventKind::TransportFailure) {
+        mclog::tagWarn(
+            getAppInfo().name,
+            "[SCMEET-DIAG] meeting.event kind={} ignored_for_lifecycle",
+            static_cast<int>(event.kind)
+        );
+        return;
+    }
     std::lock_guard<std::mutex> lock(_command_mutex);
     _meeting_event_pending = true;
     _meeting_error_latched.store(true);
@@ -334,6 +384,11 @@ void AppMeeting::processPendingCommands()
                     start_command->sessionId, start_command->commandId
                 );
                 if (started == stackchan::meeting::BridgeStartResult::Started) {
+                    mclog::tagInfo(
+                        getAppInfo().name,
+                        "[SCMEET-DIAG] start.accepted session={}",
+                        start_command->sessionId.c_str()
+                    );
                     _failure_state.OnAcceptedStart();
                     _meeting_error_latched.store(false);
                     _active_session_id = start_command->sessionId;
@@ -348,6 +403,12 @@ void AppMeeting::processPendingCommands()
                         );
                     }
                     _meeting_error_latched.store(true);
+                    mclog::tagWarn(
+                        getAppInfo().name,
+                        "[SCMEET-DIAG] start.failed session={} result={}",
+                        start_command->sessionId.c_str(),
+                        static_cast<int>(started)
+                    );
                     sendError(*start_command, "DEVICE_ERROR");
                     GetHAL().markMeetingCommandStartFailed(
                         start_command->sessionId, start_command->commandId
@@ -359,12 +420,37 @@ void AppMeeting::processPendingCommands()
     }
 
     if (stop_command.has_value()) {
+        {
+            std::lock_guard<std::mutex> command_lock(_command_mutex);
+            if (_pending_local_stop.has_value() &&
+                _pending_local_stop->session_id == stop_command->sessionId &&
+                _pending_local_stop->command_id == stop_command->commandId) {
+                _pending_local_stop.reset();
+            }
+        }
         if (!_audio_bridge.isRunning() || stop_command->sessionId != _active_session_id) {
+            if (!_audio_bridge.isRunning()) {
+                _active_session_id.clear();
+                _active_command_id.clear();
+                _meeting_error_latched.store(false);
+                updateUiState(view::MeetingUiState::Ready);
+                return;
+            }
             sendError(*stop_command, "DEVICE_ERROR");
             return;
         }
         updateUiState(view::MeetingUiState::Stopping);
         auto result = _audio_bridge.stopAndDrain(stop_command->commandId);
+        mclog::tagInfo(
+            getAppInfo().name,
+            "[SCMEET-DIAG] stop.drain status={} lastSequence={} accepted={} terminalKnown={}",
+            static_cast<int>(result.status),
+            result.last_sequence.has_value() ? static_cast<int>(*result.last_sequence) : -1,
+            result.last_transport_accepted_sequence.has_value()
+                ? static_cast<int>(*result.last_transport_accepted_sequence)
+                : -1,
+            result.terminal_outcome_known ? 1 : 0
+        );
         if (ShouldCommitStoppedCommand(result.terminal_outcome_known)) {
             {
                 std::lock_guard<std::mutex> command_lock(_command_mutex);
@@ -375,19 +461,20 @@ void AppMeeting::processPendingCommands()
             }
             GetHAL().markMeetingCommandStopped(stop_command->sessionId, stop_command->commandId);
         }
-        if (result.completed && result.status == stackchan::meeting::BridgeStopStatus::Complete &&
-            result.error == stackchan::meeting::MeetingError::None) {
+        const bool completed_ok =
+            result.completed &&
+            result.status == stackchan::meeting::BridgeStopStatus::Complete &&
+            result.error == stackchan::meeting::MeetingError::None;
+        if (!ShouldReportStopAsDeviceError(
+                _audio_bridge.isRunning(), result.terminal_outcome_known, completed_ok
+            )) {
             _active_session_id.clear();
             _active_command_id.clear();
+            _meeting_error_latched.store(false);
             updateUiState(view::MeetingUiState::Ready);
         } else {
             _meeting_error_latched.store(true);
-            stackchan::meeting::BridgeAbortResult evidence;
-            evidence.cause = result.error;
-            evidence.last_attempted_sequence = result.last_attempted_sequence;
-            evidence.last_enqueued_sequence = result.last_enqueued_sequence;
-            evidence.last_transport_accepted_sequence = result.last_transport_accepted_sequence;
-            result.error_control = sendError(*stop_command, "DEVICE_ERROR", &evidence);
+            result.error_control = sendError(*stop_command, "DEVICE_ERROR");
             updateUiState(view::MeetingUiState::Error);
         }
         {
@@ -466,6 +553,14 @@ void AppMeeting::requestLocalStop()
     ArduinoJson::serializeJson(doc, json);
     const auto disposition = GetHAL().enqueueMeetingControl(json);
     if (disposition.enqueued || disposition.locally_accepted) {
+        {
+            std::lock_guard<std::mutex> lock(_command_mutex);
+            _pending_local_stop = PendingLocalStop{
+                _active_session_id,
+                command_id,
+                GetHAL().millis() + kLocalStopConfirmationTimeoutMs,
+            };
+        }
         updateUiState(view::MeetingUiState::Stopping);
     } else {
         updateUiState(view::MeetingUiState::Error);
@@ -474,8 +569,7 @@ void AppMeeting::requestLocalStop()
 
 MeetingEnqueueDisposition_t AppMeeting::sendError(
     const WsMeetingCommand_t& command,
-    const char* code,
-    const stackchan::meeting::BridgeAbortResult* evidence
+    const char* code
 )
 {
     ArduinoJson::JsonDocument doc;
@@ -486,22 +580,15 @@ MeetingEnqueueDisposition_t AppMeeting::sendError(
         esp_random(), esp_random() & 0xFFFFU, esp_random() & 0x0FFFU,
         (esp_random() & 0x3FFFU) | 0x8000U, esp_random(), esp_random() & 0xFFFFU
     );
-    if (!command.messageId.empty()) doc["correlationMessageId"] = command.messageId;
     if (!command.commandId.empty()) doc["commandId"] = command.commandId;
     if (!command.sessionId.empty()) doc["sessionId"] = command.sessionId;
     doc["code"] = code;
-    if (evidence != nullptr) {
-        if (evidence->last_attempted_sequence.has_value()) {
-            doc["lastAttemptedSequence"] = *evidence->last_attempted_sequence;
-        }
-        if (evidence->last_enqueued_sequence.has_value()) {
-            doc["lastEnqueuedSequence"] = *evidence->last_enqueued_sequence;
-        }
-        if (evidence->last_transport_accepted_sequence.has_value()) {
-            doc["lastLocalSocketAcceptedSequence"] =
-                *evidence->last_transport_accepted_sequence;
-        }
-    }
+    mclog::tagWarn(
+        getAppInfo().name,
+        "[SCMEET-DIAG] meeting.error code={} session={}",
+        code,
+        command.sessionId.c_str()
+    );
     std::string json;
     ArduinoJson::serializeJson(doc, json);
     if (!command.sessionId.empty() && !command.commandId.empty()) {

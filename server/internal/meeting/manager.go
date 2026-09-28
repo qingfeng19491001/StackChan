@@ -657,9 +657,6 @@ func (m *MemoryManager) OnDeviceEvent(ctx context.Context, mac string, event Eve
 		return ErrInvalidEvent
 	}
 	message := ControlMessage{Action: event.Action, SessionID: event.SessionID, CommandID: event.CommandID, FirstSequence: event.FirstSequence, LastSequence: event.LastSequence, Reason: event.Reason}
-	if err := m.transport.SendOwner(ctx, session.Owner, message); err != nil {
-		return err
-	}
 	if event.Action == "meeting.stopped" {
 		if err := m.releaseSession(ctx, session); err != nil {
 			return err
@@ -669,7 +666,7 @@ func (m *MemoryManager) OnDeviceEvent(ctx context.Context, mac string, event Eve
 		meetingmetrics.Default.IncCompleted()
 		meetingaudit.Record(meetingaudit.Event{Action: "meeting.complete", MAC: mac, UserID: session.Owner.UserID, SessionID: session.SessionID})
 	}
-	return nil
+	return m.transport.SendOwner(ctx, session.Owner, message)
 }
 
 func (m *MemoryManager) OnAudio(ctx context.Context, mac string, payload []byte) error {
@@ -809,7 +806,7 @@ func (m *MemoryManager) ReattachOwner(ctx context.Context, command ReattachComma
 		return ErrAudioGap
 	}
 	for _, buffered := range session.audioBuffer[replayIndex:] {
-		if err := m.transport.SendOwnerAudio(ctx, session.Owner, buffered.payload); err != nil {
+		if err := m.transport.SendOwnerAudio(ctx, command.Owner, buffered.payload); err != nil {
 			return err
 		}
 	}

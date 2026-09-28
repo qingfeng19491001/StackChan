@@ -27,6 +27,12 @@ public:
     void onDestroy() override;
 
 private:
+    struct PendingLocalStop {
+        std::string session_id;
+        std::string command_id;
+        uint32_t deadline_ms = 0;
+    };
+
     std::unique_ptr<view::MeetingPage> _page;
     stackchan::meeting::MeetingAudioBridge _audio_bridge;
     std::mutex _command_mutex;
@@ -42,6 +48,7 @@ private:
     bool _protocol_selected = false;
     bool _ui_open = false;
     bool _awaiting_start_offer = false;
+    std::optional<PendingLocalStop> _pending_local_stop;
     uint32_t _next_pairing_attempt_ms = 0;
     std::string _pairing_uri;
     MeetingCommandPolicy _command_policy;
@@ -59,8 +66,7 @@ private:
     void requestLocalStop();
     MeetingEnqueueDisposition_t sendError(
         const WsMeetingCommand_t& command,
-        const char* code,
-        const stackchan::meeting::BridgeAbortResult* evidence = nullptr
+        const char* code
     );
     void markStartFailed(const std::string& session_id, const std::string& command_id);
     void updateUiState(view::MeetingUiState state);

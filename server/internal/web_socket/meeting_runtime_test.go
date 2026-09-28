@@ -32,6 +32,31 @@ func TestStartCommandMatchesFirmwareAudioSchema(t *testing.T) {
 	}
 }
 
+func TestStopCommandMatchesFirmwareSchema(t *testing.T) {
+	frame := controlPayload(deviceBoundControl(meeting.ControlMessage{
+		Action: "meeting.stop", SessionID: uuid.NewString(), CommandID: uuid.NewString(),
+		Reason: "interrupted", MAC: "AABBCCDDEEFF",
+	}))
+	var body map[string]any
+	if err := json.Unmarshal((*frame)[5:], &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body) != 5 {
+		t.Fatalf("firmware requires 5 stop fields: %#v", body)
+	}
+	if _, ok := body["reason"]; ok {
+		t.Fatalf("device-bound meeting.stop must not include reason: %#v", body)
+	}
+	if _, ok := body["mac"]; ok {
+		t.Fatalf("device-bound meeting.stop must not include mac: %#v", body)
+	}
+	for _, key := range []string{"protocolVersion", "action", "messageId", "commandId", "sessionId"} {
+		if _, ok := body[key]; !ok {
+			t.Fatalf("missing %s: %#v", key, body)
+		}
+	}
+}
+
 func TestMeetingStartImmediatelyReturnsDeviceOfflineAfterSocketDisconnect(t *testing.T) {
 	deviceServer, devicePeer := websocketPair(t)
 	defer deviceServer.Close()
@@ -88,6 +113,94 @@ func TestMeetingStartImmediatelyReturnsDeviceOfflineAfterSocketDisconnect(t *tes
 	}
 	if response["sessionId"] != request.SessionID || response["commandId"] != request.CommandID {
 		t.Fatalf("offline error does not identify rejected command: %+v", response)
+	}
+}
+
+func TestOwnerCanReattachAfterAudioArrivesWhileLocalSocketIsDisconnected(t *testing.T) {
+	deviceServer, devicePeer := websocketPair(t)
+	defer deviceServer.Close()
+	defer devicePeer.Close()
+	appServer, appPeer := websocketPair(t)
+	defer appServer.Close()
+	defer appPeer.Close()
+
+	mac := "AABBCCDDEEFF"
+	device := model.NewStackChanClient(mac, deviceServer, nil, nil, false)
+	defer device.CloseWriterCoroutine()
+	if !device.SelectMeetingV1(device.ConnectionGeneration()) {
+		t.Fatal("failed to select meeting-v1 for test device")
+	}
+	stackChanClientPool.Store(mac, device)
+	defer stackChanClientPool.Delete(mac)
+
+	app := model.NewAppClient(mac, appServer, "phone")
+	defer app.CloseWriterCoroutine()
+	app.SetUserID("owner")
+	app.SetMeetingAuthorization("owner", "phone", app.ConnectionGeneration())
+	app.SelectMeetingV1(app.ConnectionGeneration())
+	addAppClient(app)
+	defer appClientPool.Delete(mac)
+
+	manager := meeting.NewMemoryManagerWithOptions(
+		wsMeetingTransport{},
+		meeting.ManagerOptions{EnableReattach: true},
+	)
+	owner := meeting.Owner{
+		MAC: mac, UserID: "owner", DeviceID: "phone",
+		Generation: app.ConnectionGeneration(),
+	}
+	start := meeting.StartCommand{
+		Owner: owner, MAC: mac, SessionID: uuid.NewString(), CommandID: uuid.NewString(),
+	}
+	if _, err := manager.Start(context.Background(), start); err != nil {
+		t.Fatal(err)
+	}
+	readBinaryMessage(t, devicePeer)
+	if err := manager.OnDeviceEvent(context.Background(), mac, meeting.Event{
+		Action: "meeting.started", SessionID: start.SessionID,
+		CommandID: start.CommandID, FirstSequence: uint32Pointer(0),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	readBinaryMessage(t, appPeer)
+
+	if !app.ClearConnection(owner.Generation) {
+		t.Fatal("failed to detach original app socket")
+	}
+	manager.OnOwnerDisconnect(context.Background(), owner)
+	if err := manager.OnAudio(context.Background(), mac, encodeMeetingAudio(t, start.SessionID, 0)); err != nil {
+		t.Fatalf("audio during reattach window interrupted session: %v", err)
+	}
+
+	replacementServer, replacementPeer := websocketPair(t)
+	defer replacementServer.Close()
+	defer replacementPeer.Close()
+	_, replacementGeneration := app.SwapConnection(replacementServer)
+	app.SetMeetingAuthorization("owner", "phone", replacementGeneration)
+	app.SelectMeetingV1(replacementGeneration)
+	replacementOwner := owner
+	replacementOwner.Generation = replacementGeneration
+	if err := manager.ReattachOwner(context.Background(), meeting.ReattachCommand{
+		Owner: replacementOwner, MAC: mac, SessionID: start.SessionID,
+		CommandID: uuid.NewString(),
+	}); err != nil {
+		t.Fatalf("reattach after transient disconnect: %v", err)
+	}
+
+	replayed := readBinaryMessage(t, replacementPeer)
+	messageType, payload, err := wsprotocol.ParseBinaryMessage(replayed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if messageType != wsprotocol.OpusMessageType {
+		t.Fatalf("replayed message type = %d", messageType)
+	}
+	envelope, err := wsprotocol.DecodeMeetingAudio(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envelope.Sequence != 0 || envelope.SessionID.String() != start.SessionID {
+		t.Fatalf("replayed audio = %+v", envelope)
 	}
 }
 
@@ -159,8 +272,85 @@ func TestDeviceRequestedMeetingStartsOnlyAfterBoundAuroAccepts(t *testing.T) {
 	})
 	handleDeviceMeetingControl(context.Background(), device, stopRequested)
 	stop := parseControlMap(t, readBinaryMessage(t, appPeer))
-	if stop["action"] != "meeting.stop" || stop["commandId"] != stopCommandID {
+	if stop["action"] != "meeting.stop" || stop["commandId"] != stopCommandID || stop["reason"] != "user" {
 		t.Fatalf("stop = %+v", stop)
+	}
+}
+
+func TestAppStopWithReasonDoesNotForwardReasonToDevice(t *testing.T) {
+	deviceServer, devicePeer := websocketPair(t)
+	defer devicePeer.Close()
+	appServer, appPeer := websocketPair(t)
+	defer appPeer.Close()
+
+	mac := "AABBCCDDEEFF"
+	device := model.NewStackChanClient(mac, deviceServer, nil, nil, false)
+	defer device.CloseWriterCoroutine()
+	if !device.SelectMeetingV1(device.ConnectionGeneration()) {
+		t.Fatal("failed to select meeting-v1 for test device")
+	}
+	stackChanClientPool.Store(mac, device)
+	defer stackChanClientPool.Delete(mac)
+
+	app := model.NewAppClient(mac, appServer, "phone")
+	defer app.CloseWriterCoroutine()
+	app.SetUserID("owner")
+	app.SetMeetingAuthorization("owner", "phone", app.ConnectionGeneration())
+	app.SelectMeetingV1(app.ConnectionGeneration())
+	addAppClient(app)
+	defer appClientPool.Delete(mac)
+
+	previousRepository := pairing.DefaultRepository
+	repository := pairing.NewMemoryRepository(time.Now)
+	nonce, _ := repository.IssueNonce(mac, device.ConnectionGeneration())
+	if err := repository.Bind("owner", mac, nonce.Value, device.ConnectionGeneration()); err != nil {
+		t.Fatal(err)
+	}
+	pairing.DefaultRepository = repository
+	defer func() { pairing.DefaultRepository = previousRepository }()
+	previousManager := meetingManager
+	meetingManager = meeting.NewMemoryManager(wsMeetingTransport{})
+	defer func() { meetingManager = previousManager }()
+
+	sessionID, commandID := uuid.NewString(), uuid.NewString()
+	startPayload, err := json.Marshal(wsprotocol.MeetingControl{
+		ProtocolVersion: 1, Action: "meeting.start", MessageID: uuid.NewString(),
+		SessionID: sessionID, CommandID: commandID, MAC: mac,
+		Audio: &wsprotocol.MeetingAudioParameters{Codec: "opus", SampleRate: 16000, Channels: 1, FrameDurationMS: 60},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handleAppMeetingControl(context.Background(), app, startPayload)
+	if got := parseControlMap(t, readBinaryMessage(t, devicePeer)); got["action"] != "meeting.start" {
+		t.Fatalf("start = %+v", got)
+	}
+
+	first := uint32(0)
+	started, err := json.Marshal(wsprotocol.MeetingControl{
+		ProtocolVersion: 1, Action: "meeting.started", MessageID: uuid.NewString(),
+		SessionID: sessionID, CommandID: commandID, FirstSequence: &first,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handleDeviceMeetingControl(context.Background(), device, started)
+	readBinaryMessage(t, appPeer)
+
+	stopPayload, err := json.Marshal(wsprotocol.MeetingControl{
+		ProtocolVersion: 1, Action: "meeting.stop", MessageID: uuid.NewString(),
+		SessionID: sessionID, CommandID: uuid.NewString(), MAC: mac, Reason: "user",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handleAppMeetingControl(context.Background(), app, stopPayload)
+	stop := parseControlMap(t, readBinaryMessage(t, devicePeer))
+	if stop["action"] != "meeting.stop" || len(stop) != 5 {
+		t.Fatalf("firmware requires 5 stop fields: %#v", stop)
+	}
+	if _, ok := stop["reason"]; ok {
+		t.Fatalf("device-bound meeting.stop leaked reason: %#v", stop)
 	}
 }
 
