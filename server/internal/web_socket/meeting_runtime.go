@@ -69,6 +69,17 @@ func controlPayload(message meeting.ControlMessage) *[]byte {
 	return createMessage(wsprotocol.MeetingControlMessageType, encoded)
 }
 
+// deviceBoundControl drops fields the firmware inbound schema rejects.
+// meeting.stop is exactly five fields; reason belongs on App-originated stop
+// and on meeting.stopped, never on the device-bound command.
+func deviceBoundControl(message meeting.ControlMessage) meeting.ControlMessage {
+	if message.Action == "meeting.stop" {
+		message.Reason = ""
+		message.MAC = ""
+	}
+	return message
+}
+
 func (wsMeetingTransport) SendBoundApps(ctx context.Context, mac string, message meeting.ControlMessage) error {
 	if err := sendBoundAppsLocal(ctx, mac, message); err == nil {
 		return nil
@@ -100,6 +111,7 @@ func sendBoundAppsLocal(ctx context.Context, mac string, message meeting.Control
 }
 
 func (wsMeetingTransport) SendDevice(ctx context.Context, mac string, message meeting.ControlMessage) error {
+	message = deviceBoundControl(message)
 	// A local registry entry is authoritative even after its socket has been
 	// cleared. Preserve ErrDeviceOffline instead of replacing it with a generic
 	// cluster-publish error in the single-instance deployment.
@@ -121,7 +133,7 @@ func sendDeviceLocal(ctx context.Context, mac string, message meeting.ControlMes
 	if !client.SupportsMeetingV1(client.ConnectionGeneration()) {
 		return meeting.ErrDeviceOffline
 	}
-	frame, messageType := controlPayload(message), websocket.BinaryMessage
+	frame, messageType := controlPayload(deviceBoundControl(message)), websocket.BinaryMessage
 	if stackChanSendMessage(ctx, client, &messageType, frame) != model.SendEnqueued {
 		return modelSendError{}
 	}
@@ -129,10 +141,15 @@ func sendDeviceLocal(ctx context.Context, mac string, message meeting.ControlMes
 }
 
 func (wsMeetingTransport) SendOwner(ctx context.Context, owner meeting.Owner, message meeting.ControlMessage) error {
-	if err := sendOwnerLocal(ctx, owner, message); err == nil {
+	err := sendOwnerLocal(ctx, owner, message)
+	if err == nil {
 		return nil
 	}
-	return currentMeetingCluster().Publish(ctx, clusterDelivery{Kind: clusterToOwner, Owner: owner, Control: &message})
+	cluster := currentMeetingCluster()
+	if owner.NodeID == "" || owner.NodeID == cluster.NodeID() {
+		return err
+	}
+	return cluster.Publish(ctx, clusterDelivery{Kind: clusterToOwner, Owner: owner, Control: &message})
 }
 
 func sendOwnerLocal(ctx context.Context, owner meeting.Owner, message meeting.ControlMessage) error {
@@ -148,10 +165,15 @@ func sendOwnerLocal(ctx context.Context, owner meeting.Owner, message meeting.Co
 }
 
 func (wsMeetingTransport) SendOwnerAudio(ctx context.Context, owner meeting.Owner, payload []byte) error {
-	if err := sendOwnerAudioLocal(ctx, owner, payload); err == nil {
+	err := sendOwnerAudioLocal(ctx, owner, payload)
+	if err == nil {
 		return nil
 	}
-	return currentMeetingCluster().Publish(ctx, clusterDelivery{Kind: clusterAudioOwner, Owner: owner, Audio: append([]byte(nil), payload...)})
+	cluster := currentMeetingCluster()
+	if owner.NodeID == "" || owner.NodeID == cluster.NodeID() {
+		return err
+	}
+	return cluster.Publish(ctx, clusterDelivery{Kind: clusterAudioOwner, Owner: owner, Audio: append([]byte(nil), payload...)})
 }
 
 func sendOwnerAudioLocal(ctx context.Context, owner meeting.Owner, payload []byte) error {
@@ -218,11 +240,13 @@ func meetingErrorCode(err error) string {
 }
 
 func sendMeetingError(ctx context.Context, client *model.AppClient, request wsprotocol.MeetingControl, err error) {
+	code := meetingErrorCode(err)
+	logger.Warningf(ctx, "[SCMEET-DIAG] app.error action=%s session=%s code=%s", request.Action, request.SessionID, code)
 	frame := controlPayload(meeting.ControlMessage{
 		Action:    "meeting.error",
 		SessionID: request.SessionID,
 		CommandID: request.CommandID,
-		Code:      meetingErrorCode(err),
+		Code:      code,
 	})
 	messageType := websocket.BinaryMessage
 	appSendMessage(ctx, client, &messageType, frame)
@@ -233,22 +257,36 @@ func notifyMeetingOwnerError(ctx context.Context, mac string, request wsprotocol
 	if session == nil {
 		return
 	}
+	// Device retries can surface an event from an older meeting after the
+	// owner has already started a new one. Never leak that stale error into the
+	// current owner's socket: the App would treat it as the active command and
+	// abort a healthy start/reconnect.
+	if request.SessionID != "" && request.SessionID != session.SessionID {
+		return
+	}
+	if request.CommandID != "" && request.CommandID != session.StartCommandID && request.CommandID != session.StopCommandID {
+		return
+	}
 	if request.SessionID == "" {
 		request.SessionID = session.SessionID
 	}
+	code := meetingErrorCode(err)
+	logger.Warningf(ctx, "[SCMEET-DIAG] owner.error mac=%s session=%s code=%s", mac, request.SessionID, code)
 	_ = (wsMeetingTransport{}).SendOwner(ctx, session.Owner, meeting.ControlMessage{
 		Action:    "meeting.error",
 		SessionID: request.SessionID,
 		CommandID: request.CommandID,
-		Code:      meetingErrorCode(err),
+		Code:      code,
 	})
 }
 
 func handleDeviceMeetingControl(ctx context.Context, client *model.StackChanClient, payload []byte) bool {
 	message, err := wsprotocol.ParseMeetingControlForDirection(payload, wsprotocol.DirectionDevice)
 	if err != nil {
+		logger.Warningf(ctx, "[SCMEET-DIAG] device.parse_failed mac=%s error=%v", client.GetMac(), err)
 		return true
 	}
+	logMeetingControl(ctx, "device", message)
 	if message.Action == wsprotocol.ActionProtocolHello && message.SupportsMeetingV1() {
 		generation := client.ConnectionGeneration()
 		client.SelectMeetingV1(generation)
@@ -268,6 +306,7 @@ func handleDeviceMeetingControl(ctx context.Context, client *model.StackChanClie
 		}
 	} else if message.Action == "meeting.started" || message.Action == "meeting.stopped" {
 		if err := meetingManager.OnDeviceEvent(ctx, client.GetMac(), meeting.Event{Action: message.Action, SessionID: message.SessionID, CommandID: message.CommandID, FirstSequence: message.FirstSequence, LastSequence: message.LastSequence, Reason: message.Reason}); err != nil {
+			logger.Warningf(ctx, "[SCMEET-DIAG] device.event_rejected action=%s session=%s lastSequence=%v code=%s", message.Action, message.SessionID, formatOptionalUint32(message.LastSequence), meetingErrorCode(err))
 			notifyMeetingOwnerError(ctx, client.GetMac(), message, err)
 		}
 	} else if message.Action == "meeting.error" {
@@ -283,8 +322,10 @@ func handleDeviceMeetingControl(ctx context.Context, client *model.StackChanClie
 func handleAppMeetingControl(ctx context.Context, client *model.AppClient, payload []byte) bool {
 	message, err := wsprotocol.ParseMeetingControlForDirection(payload, wsprotocol.DirectionApp)
 	if err != nil {
+		logger.Warningf(ctx, "[SCMEET-DIAG] app.parse_failed error=%v", err)
 		return true
 	}
+	logMeetingControl(ctx, "app", message)
 	if message.Action == wsprotocol.ActionProtocolHello && message.SupportsMeetingV1() {
 		generation := client.ConnectionGeneration()
 		client.SelectMeetingV1(generation)
@@ -292,9 +333,11 @@ func handleAppMeetingControl(ctx context.Context, client *model.AppClient, paylo
 		return true
 	}
 	if !client.SupportsMeetingV1(client.ConnectionGeneration()) {
+		sendMeetingError(ctx, client, message, meeting.ErrUnauthorized)
 		return true
 	}
 	if client.MeetingTicketMAC(client.ConnectionGeneration()) == "" {
+		sendMeetingError(ctx, client, message, meeting.ErrUnauthorized)
 		return true
 	}
 	if normalized, normalizeErr := pairing.NormalizeMAC(message.MAC); normalizeErr != nil || normalized != client.MeetingTicketMAC(client.ConnectionGeneration()) {
@@ -325,8 +368,16 @@ func handleAppMeetingControl(ctx context.Context, client *model.AppClient, paylo
 			sendMeetingError(ctx, client, message, err)
 		}
 	case "meeting.reattach":
+		var lastReceivedSequence any = "none"
+		if message.LastReceivedSequence != nil {
+			lastReceivedSequence = *message.LastReceivedSequence
+		}
+		logger.Infof(ctx, "[SCMEET-REATTACH] requested mac=%s generation=%d lastReceivedSequence=%v", message.MAC, owner.Generation, lastReceivedSequence)
 		if err := meetingManager.ReattachOwner(ctx, meeting.ReattachCommand{Owner: owner, MAC: message.MAC, SessionID: message.SessionID, CommandID: message.CommandID, LastReceivedSequence: message.LastReceivedSequence}); err != nil {
+			logger.Warningf(ctx, "[SCMEET-REATTACH] rejected mac=%s generation=%d code=%s", message.MAC, owner.Generation, meetingErrorCode(err))
 			sendMeetingError(ctx, client, message, err)
+		} else {
+			logger.Infof(ctx, "[SCMEET-REATTACH] accepted mac=%s generation=%d", message.MAC, owner.Generation)
 		}
 	}
 	return true

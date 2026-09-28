@@ -255,6 +255,7 @@ func CheckExpiredLinks(ctx context.Context) {
 		conn, generation := stackChanClient.ConnectionSnapshot()
 		cleared := stackChanClient.ClearConnection(generation)
 		if cleared {
+			observeMeetingDisconnect(ctx, mac, "device_expired")
 			meetingManager.OnDeviceDisconnect(ctx, mac)
 			stackChanClient.CloseWriterCoroutine()
 		}

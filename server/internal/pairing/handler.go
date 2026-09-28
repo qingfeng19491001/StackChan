@@ -218,18 +218,23 @@ func (h HTTPHandlers) WSTicket(r *ghttp.Request) {
 		h.write(r, http.StatusBadRequest, map[string]string{"code": "INVALID_REQUEST"})
 		return
 	}
-	if _, online := h.DeviceGeneration(request.MAC); !online {
-		meetingaudit.Record(meetingaudit.Event{Action: "pair.ticket", Outcome: "rejected", MAC: request.MAC, UserID: userID, Code: "DEVICE_OFFLINE"})
+	mac, normalizeErr := NormalizeMAC(request.MAC)
+	if normalizeErr != nil || strings.TrimSpace(request.DeviceID) == "" {
+		h.write(r, http.StatusBadRequest, map[string]string{"code": "INVALID_REQUEST"})
+		return
+	}
+	if _, online := h.DeviceGeneration(mac); !online {
+		meetingaudit.Record(meetingaudit.Event{Action: "pair.ticket", Outcome: "rejected", MAC: mac, UserID: userID, Code: "DEVICE_OFFLINE"})
 		h.write(r, http.StatusConflict, map[string]string{"code": "DEVICE_OFFLINE"})
 		return
 	}
-	ticket, err := h.Repository.IssueTicket(userID, request.MAC, "app", request.DeviceID)
+	ticket, err := h.Repository.IssueTicket(userID, mac, "app", request.DeviceID)
 	if err != nil {
-		meetingaudit.Record(meetingaudit.Event{Action: "pair.ticket", Outcome: "rejected", MAC: request.MAC, UserID: userID, Code: "NOT_BOUND"})
+		meetingaudit.Record(meetingaudit.Event{Action: "pair.ticket", Outcome: "rejected", MAC: mac, UserID: userID, Code: "NOT_BOUND"})
 		h.write(r, http.StatusForbidden, map[string]string{"code": "NOT_BOUND"})
 		return
 	}
-	meetingaudit.Record(meetingaudit.Event{Action: "pair.ticket", MAC: request.MAC, UserID: userID})
+	meetingaudit.Record(meetingaudit.Event{Action: "pair.ticket", MAC: mac, UserID: userID})
 	h.write(r, http.StatusOK, map[string]any{"ticket": ticket.Value, "expiresAt": ticket.ExpiresAt})
 }
 

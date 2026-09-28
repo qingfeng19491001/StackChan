@@ -90,6 +90,37 @@ func TestDeviceStopRequestNotifiesStableOwnerAndUsesSameBarrier(t *testing.T) {
 	}
 }
 
+func TestDeviceStoppedCommitsTerminalStateWhenOwnerNotificationFails(t *testing.T) {
+	transport := &fakeTransport{}
+	manager := NewMemoryManager(transport)
+	start := StartCommand{Owner: Owner{MAC: "AABBCCDDEEFF", UserID: "u1", DeviceID: "phone1", Generation: 1}, MAC: "AABBCCDDEEFF", SessionID: uuid.NewString(), CommandID: uuid.NewString()}
+	if _, err := manager.Start(context.Background(), start); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.OnDeviceEvent(context.Background(), start.MAC, Event{Action: "meeting.started", SessionID: start.SessionID, CommandID: start.CommandID, FirstSequence: uint32Ptr(0)}); err != nil {
+		t.Fatal(err)
+	}
+	stopCommandID := uuid.NewString()
+	if _, err := manager.Stop(context.Background(), StopCommand{Owner: start.Owner, MAC: start.MAC, SessionID: start.SessionID, CommandID: stopCommandID}); err != nil {
+		t.Fatal(err)
+	}
+
+	transport.failOwnerControl = true
+	err := manager.OnDeviceEvent(context.Background(), start.MAC, Event{Action: "meeting.stopped", SessionID: start.SessionID, CommandID: stopCommandID})
+	if !errors.Is(err, ErrOwnerOffline) {
+		t.Fatalf("owner notification error = %v, want %v", err, ErrOwnerOffline)
+	}
+	if manager.Active(start.MAC) != nil {
+		t.Fatal("owner notification failure left a stopped session active")
+	}
+
+	controlCount := len(transport.controls)
+	manager.OnOwnerDisconnect(context.Background(), start.Owner)
+	if len(transport.controls) != controlCount {
+		t.Fatalf("owner cleanup sent duplicate device control: before=%d after=%d", controlCount, len(transport.controls))
+	}
+}
+
 func TestReattachReplaysOnlyFramesAfterLastReceivedSequence(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	transport := &fakeTransport{}
@@ -116,6 +147,11 @@ func TestReattachReplaysOnlyFramesAfterLastReceivedSequence(t *testing.T) {
 	}
 	if got := audioSequences(t, transport.audio); len(got) != 3 || got[0] != 0 || got[1] != 1 || got[2] != 2 {
 		t.Fatalf("delivered sequences = %v", got)
+	}
+	for index, sent := range transport.audio[1:] {
+		if sent.owner != reattachedOwner {
+			t.Fatalf("replayed audio[%d] owner = %+v, want %+v", index, sent.owner, reattachedOwner)
+		}
 	}
 }
 
@@ -414,10 +450,11 @@ type sentAudio struct {
 	payload []byte
 }
 type fakeTransport struct {
-	controls     []ControlRoute
-	audio        []sentAudio
-	ownerOffline bool
-	failDevice   bool
+	controls         []ControlRoute
+	audio            []sentAudio
+	ownerOffline     bool
+	failOwnerControl bool
+	failDevice       bool
 }
 
 func (f *fakeTransport) SendBoundApps(_ context.Context, mac string, message ControlMessage) error {
@@ -433,6 +470,9 @@ func (f *fakeTransport) SendDevice(_ context.Context, mac string, message Contro
 	return nil
 }
 func (f *fakeTransport) SendOwner(_ context.Context, owner Owner, message ControlMessage) error {
+	if f.failOwnerControl {
+		return ErrOwnerOffline
+	}
 	f.controls = append(f.controls, ControlRoute{Owner: owner, Message: message})
 	return nil
 }

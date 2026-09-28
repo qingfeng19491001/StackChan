@@ -109,4 +109,8 @@ func TestStrictMeetingControlAcceptsDeviceErrorAndNullableStoppedBarrier(t *test
 	if _, err := ParseMeetingControlForDirection([]byte(stopped), DirectionDevice); err != nil {
 		t.Fatalf("zero-frame stopped rejected: %v", err)
 	}
+	stoppedWithError := `{"protocolVersion":1,"action":"meeting.stopped","messageId":"00112233-4455-6677-8899-aabbccddeeff","commandId":"11112233-4455-6677-8899-aabbccddeeff","sessionId":"22222233-4455-6677-8899-aabbccddeeff","lastSequence":7,"reason":"error"}`
+	if _, err := ParseMeetingControlForDirection([]byte(stoppedWithError), DirectionDevice); err != nil {
+		t.Fatalf("error terminal reason rejected: %v", err)
+	}
 }

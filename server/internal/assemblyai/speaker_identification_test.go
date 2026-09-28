@@ -28,19 +28,23 @@ func TestSpeakerIdentificationCreateAndQuery(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Fatal(err)
 			}
-			if body["speaker_labels"] != true || body["language_detection"] != true || body["audio_url"] != "https://upload.test/audio" {
+			if body["speaker_labels"] != true || body["language_detection"] != true || body["audio_url"] != "https://upload.test/audio" || body["speakers_expected"] != float64(2) {
 				t.Fatalf("unexpected submit body: %#v", body)
 			}
 			understanding := body["speech_understanding"].(map[string]any)
 			request := understanding["request"].(map[string]any)
 			identification := request["speaker_identification"].(map[string]any)
-			if identification["speaker_type"] != "name" || identification["effort"] != "low" {
+			if identification["speaker_type"] != "name" || identification["effort"] != "medium" {
 				t.Fatalf("unexpected identification: %#v", identification)
 			}
 			speakers := identification["speakers"].([]any)
 			first := speakers[0].(map[string]any)
 			if first["name"] != "张三" || first["description"] != "主持会议" {
 				t.Fatalf("unexpected speaker: %#v", first)
+			}
+			second := speakers[1].(map[string]any)
+			if second["name"] != "李四" || second["description"] != "项目负责人" {
+				t.Fatalf("unexpected second speaker: %#v", second)
 			}
 			_, _ = w.Write([]byte(`{"id":"transcript-1","status":"queued"}`))
 		case "/v2/transcript/transcript-1":
@@ -62,7 +66,10 @@ func TestSpeakerIdentificationCreateAndQuery(t *testing.T) {
 	}
 	id, err := service.Create(context.Background(), bytes.NewReader([]byte("RIFF-test")), IdentificationConfig{
 		SpeakerType: "name",
-		Speakers:    []SpeakerCandidate{{Value: "张三", Description: "主持会议"}},
+		Speakers: []SpeakerCandidate{
+			{Value: "张三", Description: "主持会议"},
+			{Value: "李四", Description: "项目负责人"},
+		},
 	})
 	if err != nil || id != "transcript-1" {
 		t.Fatalf("id=%q err=%v", id, err)
@@ -92,6 +99,67 @@ func TestSpeakerIdentificationQueryPropagatesProcessingAndFailure(t *testing.T) 
 	second, err := service.Query(context.Background(), "transcript-1")
 	if err != nil || second.Status != "failed" || second.Error != "bad audio" {
 		t.Fatalf("second=%+v err=%v", second, err)
+	}
+}
+
+func TestSpeakerIdentificationQueryKeepsPollingUntilIdentificationIsReady(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"status":"completed",
+			"utterances":[{"speaker":"A","text":"hello","start":0,"end":1000,"confidence":0.9}]
+		}`))
+	}))
+	defer server.Close()
+
+	service := SpeakerIdentificationService{APIKey: "test-key", APIBaseURL: server.URL, HTTPClient: server.Client()}
+	result, err := service.Query(context.Background(), "transcript-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "processing" {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+}
+
+func TestSpeakerIdentificationQueryAppliesMappingToLetterUtterances(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"status":"completed",
+			"speech_understanding":{"response":{"speaker_identification":{"status":"success","mapping":{"A":"张三","B":"李四"}}}},
+			"utterances":[{"speaker":"A","text":"hello","start":0,"end":1000,"confidence":0.9}]
+		}`))
+	}))
+	defer server.Close()
+
+	service := SpeakerIdentificationService{APIKey: "test-key", APIBaseURL: server.URL, HTTPClient: server.Client()}
+	result, err := service.Query(context.Background(), "transcript-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "completed" || result.Mapping["A"] != "张三" || result.Utterances[0].Speaker != "张三" {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+}
+
+func TestSpeakerIdentificationQueryCompletesWhenUtterancesAlreadyHaveIdentities(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"status":"completed",
+			"utterances":[{"speaker":"张三","text":"hello","start":0,"end":1000,"confidence":0.9}]
+		}`))
+	}))
+	defer server.Close()
+
+	service := SpeakerIdentificationService{APIKey: "test-key", APIBaseURL: server.URL, HTTPClient: server.Client()}
+	result, err := service.Query(context.Background(), "transcript-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "completed" || result.Utterances[0].Speaker != "张三" {
+		t.Fatalf("unexpected result: %+v", result)
 	}
 }
 

@@ -75,15 +75,25 @@ func (s SpeakerIdentificationService) Create(ctx context.Context, audio io.Reade
 		}
 		speakers = append(speakers, item)
 	}
+	// One-shot pre-recorded create: WAV is already uploaded, so speaker
+	// identification must ride along on POST /v2/transcript. Do not call
+	// llm-gateway /v1/understanding here — that path requires an existing
+	// completed pre-recorded transcript ID, and a streaming session ID is not
+	// interchangeable with one.
 	body := map[string]any{
 		"audio_url":          uploadURL,
 		"language_detection": true,
 		"speaker_labels":     true,
+		// The pre-recorded pass must preserve the configured participant
+		// count. Without this constraint short meeting audio can collapse the
+		// real-time A/B turns into a single diarized speaker.
+		"speakers_expected": len(config.Speakers),
 		"speech_understanding": map[string]any{"request": map[string]any{
 			"speaker_identification": map[string]any{
 				"speaker_type": config.SpeakerType,
 				"speakers":     speakers,
-				"effort":       "low",
+				// AssemblyAI recommends medium effort for meeting-room audio.
+				"effort": "medium",
 			},
 		}},
 	}
@@ -147,29 +157,119 @@ func (s SpeakerIdentificationService) Query(ctx context.Context, transcriptID st
 	if err := s.jsonRequest(ctx, http.MethodGet, "/v2/transcript/"+transcriptID, nil, &response); err != nil {
 		return IdentificationResult{}, err
 	}
-	status := response.Status
-	if status == "queued" {
-		status = "processing"
-	}
-	if status == "error" {
-		status = "failed"
-	}
 	identification := response.SpeechUnderstanding.Response.SpeakerIdentification
-	if status == "completed" && identification.Status != "success" {
-		status = "failed"
-		if response.Error == "" {
-			response.Error = identification.Error
-		}
-		if response.Error == "" {
-			response.Error = "AssemblyAI speaker identification did not succeed"
-		}
+	status, errMsg := identificationJobStatus(
+		response.Status,
+		identification.Status,
+		identification.Mapping,
+		response.Utterances,
+		response.Error,
+		identification.Error,
+	)
+	utterances := response.Utterances
+	if status == "completed" {
+		utterances = applySpeakerMapping(utterances, identification.Mapping)
 	}
 	return IdentificationResult{
 		Status:     status,
 		Mapping:    identification.Mapping,
-		Utterances: response.Utterances,
-		Error:      response.Error,
+		Utterances: utterances,
+		Error:      errMsg,
 	}, nil
+}
+
+func identificationJobStatus(
+	transcriptStatus, identificationStatus string,
+	mapping map[string]string,
+	utterances []IdentifiedUtterance,
+	transcriptErr, identificationErr string,
+) (string, string) {
+	switch strings.ToLower(strings.TrimSpace(transcriptStatus)) {
+	case "queued", "processing":
+		return "processing", ""
+	case "error":
+		return "failed", firstNonEmpty(transcriptErr, "AssemblyAI transcription failed")
+	case "completed":
+		switch strings.ToLower(strings.TrimSpace(identificationStatus)) {
+		case "error", "failed":
+			return "failed", firstNonEmpty(
+				identificationErr,
+				transcriptErr,
+				"AssemblyAI speaker identification did not succeed",
+			)
+		case "success":
+			return "completed", ""
+		default:
+			// Identification is a nested speech-understanding task. The
+			// pre-recorded transcript can complete before mapping/utterances
+			// are rewritten; keep polling instead of failing the job.
+			if len(usableSpeakerMapping(mapping)) > 0 || utterancesHaveIdentities(utterances) {
+				return "completed", ""
+			}
+			return "processing", ""
+		}
+	default:
+		return "processing", ""
+	}
+}
+
+func applySpeakerMapping(utterances []IdentifiedUtterance, mapping map[string]string) []IdentifiedUtterance {
+	normalized := usableSpeakerMapping(mapping)
+	if len(utterances) == 0 || len(normalized) == 0 {
+		return utterances
+	}
+	out := make([]IdentifiedUtterance, len(utterances))
+	for i, utterance := range utterances {
+		out[i] = utterance
+		if name, ok := normalized[speakerKey(utterance.Speaker)]; ok {
+			out[i].Speaker = name
+		}
+	}
+	return out
+}
+
+func usableSpeakerMapping(mapping map[string]string) map[string]string {
+	normalized := make(map[string]string, len(mapping))
+	for key, value := range mapping {
+		label := speakerKey(key)
+		name := strings.TrimSpace(value)
+		if label != "" && name != "" {
+			normalized[label] = name
+		}
+	}
+	return normalized
+}
+
+func utterancesHaveIdentities(utterances []IdentifiedUtterance) bool {
+	for _, utterance := range utterances {
+		if !isGenericSpeakerLabel(utterance.Speaker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isGenericSpeakerLabel(label string) bool {
+	key := speakerKey(label)
+	return key == "" || (len(key) == 1 && key[0] >= 'A' && key[0] <= 'Z')
+}
+
+func speakerKey(label string) string {
+	value := strings.TrimSpace(label)
+	upper := strings.ToUpper(value)
+	if strings.HasPrefix(upper, "SPEAKER") {
+		value = strings.TrimSpace(value[len("SPEAKER"):])
+	}
+	return strings.ToUpper(strings.TrimSpace(value))
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func (s SpeakerIdentificationService) jsonRequest(ctx context.Context, method, path string, body any, target any) error {

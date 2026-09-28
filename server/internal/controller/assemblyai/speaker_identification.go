@@ -69,7 +69,13 @@ func (h SpeakerIdentificationHandlers) Create(r *ghttp.Request) {
 	}
 	transcriptID, err := h.Service.Create(r.Context(), audio, config)
 	if err != nil {
-		h.writeError(r, http.StatusBadGateway, "ASSEMBLYAI_CREATE_FAILED", "unable to create speaker identification job")
+		status := http.StatusBadGateway
+		code := "ASSEMBLYAI_CREATE_FAILED"
+		if errors.Is(err, assemblyaiservice.ErrAPIKeyNotConfigured) {
+			status = http.StatusServiceUnavailable
+			code = "ASSEMBLYAI_NOT_CONFIGURED"
+		}
+		h.writeError(r, status, code, err.Error())
 		return
 	}
 	jobToken, err := h.Signer.Sign(transcriptID, userID, h.now().Add(24*time.Hour))
@@ -108,7 +114,7 @@ func (h SpeakerIdentificationHandlers) Query(r *ghttp.Request) {
 	}
 	result, err := h.Service.Query(r.Context(), transcriptID)
 	if err != nil {
-		h.writeError(r, http.StatusBadGateway, "ASSEMBLYAI_QUERY_FAILED", "unable to query speaker identification job")
+		h.writeError(r, http.StatusBadGateway, "ASSEMBLYAI_QUERY_FAILED", err.Error())
 		return
 	}
 	h.write(r, http.StatusOK, map[string]any{"code": 0, "message": "success", "data": result})
